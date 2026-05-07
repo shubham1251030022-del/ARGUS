@@ -1,0 +1,35 @@
+[
+  {
+    "bench_id": "B1",
+    "roll_number": "STU001",
+    "name": "Student 1",
+    "x1": 50,
+    "y1": 100,
+    "x2": 250,
+    "y2": 400,
+    "buffer": 20,
+    "status": "ACTIVE"
+  },
+  {
+    "bench_id": "B2",
+    "roll_number": "STU002",
+    "name": "Student 2",
+    "x1": 270,
+    "y1": 100,
+    "x2": 470,
+    "y2": 400,
+    "buffer": 20,
+    "status": "ACTIVE"
+  },
+  {
+    "bench_id": "B3",
+    "roll_number": "STU003",
+    "name": "Student 3",
+    "x1": 490,
+    "y1": 100,
+    "x2": 690,
+    "y2": 400,
+    "buffer": 20,
+    "status": "ACTIVE"
+  }
+]
