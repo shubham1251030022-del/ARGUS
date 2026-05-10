@@ -1,0 +1,15 @@
+{
+  "mode": "STANDARD",
+  "threshold": 30,
+  "decay_rate": 1.0,
+  "decay_interval": 30,
+  "shoulder_clear_threshold": 10,
+  "shoulder_slight": 15,
+  "shoulder_clear": 22,
+  "shoulder_sustained": 28,
+  "head_offset_threshold": 0.22,
+  "wrist_dist_threshold": 0.38,
+  "wrist_velocity_threshold": 12,
+  "motion_threshold": 0.08,
+  "ml_confidence_threshold": 0.65
+} 

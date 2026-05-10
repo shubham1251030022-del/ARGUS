@@ -111,6 +111,17 @@ class ZoneManager:
             return 0
         return overlap_area / z1_area
 
+    def get_student_name(self, bench_id):
+        zone = self.get_zone_by_id(bench_id)
+        if zone:
+            return zone.get('name', 'Unknown')
+        return 'Unknown'
+
+    def get_roll_number(self, bench_id):
+        zone = self.get_zone_by_id(bench_id)
+        if zone:
+            return zone.get('roll_number', 'N/A')
+        return 'N/A'
 
 # ── Test ──
 if __name__ == "__main__":
