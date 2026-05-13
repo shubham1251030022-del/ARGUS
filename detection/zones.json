@@ -1,35 +1,47 @@
-[
-  {
-    "bench_id": "B1",
-    "roll_number": "1251030189",
-    "name": "Sanhita Potdar",
-    "x1": 0,
-    "y1": 0,
-    "x2": 426,
-    "y2": 720,
-    "buffer": 30,
-    "status": "ACTIVE"
-  },
-  {
-    "bench_id": "B2",
-    "roll_number": "1251030022",
-    "name": "Shubham Pitty",
-    "x1": 427,
-    "y1": 0,
-    "x2": 853,
-    "y2": 720,
-    "buffer": 30,
-    "status": "ACTIVE"
-  },
-  {
-    "bench_id": "B3",
-    "roll_number": "1251030068",
-    "name": "Empty Bench",
-    "x1": 854,
-    "y1": 0,
-    "x2": 1280,
-    "y2": 720,
-    "buffer": 30,
-    "status": "ACTIVE"
-  }
-]
+{
+    "B1": {
+        "bench_id"    : "B1",
+        "x1"          : 0,
+        "y1"          : 0,
+        "x2"          : 427,
+        "y2"          : 720,
+        "x"           : 0,
+        "y"           : 0,
+        "w"           : 427,
+        "h"           : 720,
+        "student_name": "Shubham",
+        "roll_number" : "1251030022",
+        "status"      : "ACTIVE",
+        "buffer"      : 20
+    },
+    "B2": {
+        "bench_id"    : "B2",
+        "x1"          : 427,
+        "y1"          : 0,
+        "x2"          : 854,
+        "y2"          : 720,
+        "x"           : 427,
+        "y"           : 0,
+        "w"           : 427,
+        "h"           : 720,
+        "student_name": "Sanhita",
+        "roll_number" : "1251030001",
+        "status"      : "ACTIVE",
+        "buffer"      : 20
+    },
+    "B3": {
+        "bench_id"    : "B3",
+        "x1"          : 854,
+        "y1"          : 0,
+        "x2"          : 1280,
+        "y2"          : 720,
+        "x"           : 854,
+        "y"           : 0,
+        "w"           : 426,
+        "h"           : 720,
+        "student_name": "Unknown",
+        "roll_number" : "",
+        "status"      : "ACTIVE",
+        "buffer"      : 20
+    }
+}
