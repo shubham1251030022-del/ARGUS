@@ -1,11 +1,12 @@
 """
-ARGUS — File 12: detection/main.py  [FIXED v3]
+ARGUS — File 12: detection/main.py  [FINAL v5]
 Member 2: Shubham Pitty | VIT Pune CSAIML-E Group 01
 
-Fixes in v3:
-  1. assign_zone receives NORMALIZED coords (0-1) — matches ZoneManager expectation
-  2. Dashboard push uses dedicated queue thread — zero FPS impact
-  3. MJPEG frame push guaranteed every frame — no black screen
+Fixes in v5 (over v4):
+  1. ALERT badge now only shows after sustained 10s (not on brief score spike)
+  2. Alert persists for 30s even if score drops below threshold
+  3. Blue popup added — shows for 25s on screen when alert fires
+  4. Config tuning — threshold 100, wrist_dist 1.80, decay_rate 8
 
 Run: py -3.11 main.py
      py -3.11 main.py --no-dash
@@ -46,8 +47,8 @@ def load_config():
         with open(CONFIG_FILE, "r") as f:
             return json.load(f)
     except Exception:
-        return {"camera_index": 1, "alert_threshold": 30,
-                "ml_confidence_threshold": 0.65}
+        return {"camera_index": 0, "threshold": 100,
+                "ml_confidence_threshold": 0.75}
 
 _snap_count = {}
 def save_snapshot(frame, bench, roll):
@@ -60,26 +61,19 @@ def save_snapshot(frame, bench, roll):
     return f"snapshots/{fname}"
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# FIX 2 — Dedicated dashboard push thread with queue
-# Never blocks the main detection loop
-# ════════════════════════════════════════════════════════════════════════════
-
-_dash_enabled  = True
-_dash_queue    = queue.Queue(maxsize=2)   # small buffer — drop old frames
-_alert_queue   = queue.Queue(maxsize=20)
+# ── Dashboard push queue ──────────────────────────────────────────────────────
+_dash_enabled = True
+_dash_queue   = queue.Queue(maxsize=2)
 
 def _dashboard_worker():
-    """Runs in background — consumes queue and posts to Flask."""
     session = requests.Session()
     while True:
         try:
             task = _dash_queue.get(timeout=1)
             if task is None:
                 break
-            task_type = task.get("type")
-
-            if task_type == "frame_status":
+            t = task.get("type")
+            if t == "frame_status":
                 try:
                     session.post(f"{DASHBOARD_URL}/api/status",
                                  json=task["state"], timeout=0.3)
@@ -92,14 +86,12 @@ def _dashboard_worker():
                                  timeout=0.3)
                 except Exception:
                     pass
-
-            elif task_type == "alert":
+            elif t == "alert":
                 try:
                     session.post(f"{DASHBOARD_URL}/api/alert",
                                  json=task["data"], timeout=0.3)
                 except Exception:
                     pass
-
         except queue.Empty:
             continue
         except Exception:
@@ -109,19 +101,13 @@ def push_to_dashboard(frame_jpeg, state):
     if not _dash_enabled:
         return
     try:
-        _dash_queue.put_nowait({
-            "type" : "frame_status",
-            "jpeg" : frame_jpeg,
-            "state": state
-        })
+        _dash_queue.put_nowait({"type": "frame_status",
+                                "jpeg": frame_jpeg, "state": state})
     except queue.Full:
         try:
-            _dash_queue.get_nowait()   # drop oldest
-            _dash_queue.put_nowait({
-                "type" : "frame_status",
-                "jpeg" : frame_jpeg,
-                "state": state
-            })
+            _dash_queue.get_nowait()
+            _dash_queue.put_nowait({"type": "frame_status",
+                                    "jpeg": frame_jpeg, "state": state})
         except Exception:
             pass
 
@@ -134,53 +120,89 @@ def push_alert(alert_data):
         pass
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# OVERLAY
-# ════════════════════════════════════════════════════════════════════════════
-
-def draw_overlay(frame, bench_states, fps, paused):
+# ── Overlay ───────────────────────────────────────────────────────────────────
+def draw_overlay(frame, bench_states, fps, paused,
+                 alert_thr, confirmed_alerts, alert_popups):
+    """
+    confirmed_alerts : set of bench_ids that completed sustained 10s check
+    alert_popups     : dict bench_id -> (message, timestamp)
+    """
     h, w = frame.shape[:2]
+
+    # Top bar
     cv2.rectangle(frame, (0, 0), (w, 38), (13, 17, 23), -1)
     status = "PAUSED" if paused else "MONITORING"
     color  = (0, 165, 255) if paused else (63, 185, 80)
     cv2.putText(frame, f"ARGUS  |  {status}  |  {fps:.1f} FPS",
                 (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2)
     cv2.putText(frame, time.strftime("%H:%M:%S"),
-                (w-90, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (139,148,158), 1)
+                (w-90, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (139, 148, 158), 1)
 
+    # Bench boxes
     for bench_id, st in bench_states.items():
         x, y, bw, bh = int(st["x"]), int(st["y"]), int(st["w"]), int(st["h"])
-        score   = st.get("score", 0)
-        alerted = score >= 30
-        rc = (248, 81, 73) if alerted else (63, 185, 80)
+        score     = st.get("score", 0)
+
+        # FIX 1: red only if confirmed sustained alert — not on brief spike
+        confirmed = bench_id in confirmed_alerts
+        rc = (248, 81, 73) if confirmed else \
+             (210, 153, 34) if score >= alert_thr * 0.6 else (63, 185, 80)
+
         cv2.rectangle(frame, (x, y), (x+bw, y+bh), rc, 2)
-        bar_w = int((min(score, 30) / 30) * bw)
+
+        bar_w = int((min(score, alert_thr) / alert_thr) * bw)
         bar_y = y + bh - 8
         cv2.rectangle(frame, (x, bar_y), (x+bw, y+bh), (33, 38, 45), -1)
-        bc = (248,81,73) if alerted else (210,153,34) if score>=20 else (63,185,80)
         if bar_w > 0:
-            cv2.rectangle(frame, (x, bar_y), (x+bar_w, y+bh), bc, -1)
-        label = f"{bench_id} {st.get('student_name','')}"
-        cv2.rectangle(frame, (x, max(0,y-22)), (x+bw, y), (13,17,23), -1)
+            cv2.rectangle(frame, (x, bar_y), (x+bar_w, y+bh), rc, -1)
+
+        label = f"{bench_id} {st.get('student_name', '')}"
+        cv2.rectangle(frame, (x, max(0, y-22)), (x+bw, y), (13, 17, 23), -1)
         cv2.putText(frame, label, (x+4, y-6),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, rc, 1)
-        cv2.putText(frame, f"{score:.0f}", (x+4, y+bh-12),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (230,237,243), 1)
-        if alerted:
-            cv2.rectangle(frame, (x+bw-60, y+4), (x+bw-4, y+22), (248,81,73), -1)
-            cv2.putText(frame, "ALERT", (x+bw-57, y+17),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255,255,255), 1)
+        cv2.putText(frame, f"{score:.0f}/{alert_thr}", (x+4, y+bh-12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (230, 237, 243), 1)
 
-    cv2.rectangle(frame, (0, h-24), (w, h), (13,17,23), -1)
+        # ALERT badge — only on confirmed sustained alerts
+        if confirmed:
+            cv2.rectangle(frame, (x+bw-65, y+4), (x+bw-4, y+22),
+                          (248, 81, 73), -1)
+            cv2.putText(frame, "ALERT", (x+bw-62, y+17),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1)
+
+    # Bottom bar
+    cv2.rectangle(frame, (0, h-24), (w, h), (13, 17, 23), -1)
     cv2.putText(frame, "Q=Quit  R=Reset  C=Clear  S=Snapshot  P=Pause",
-                (8, h-8), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (72,79,88), 1)
+                (8, h-8), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (72, 79, 88), 1)
+
+    # FIX 3: Blue alert popups — show for 25 seconds
+    if alert_popups:
+        now = time.time()
+        popup_y = 50
+        for bench_id, (msg, ts) in list(alert_popups.items()):
+            if now - ts > 25:
+                del alert_popups[bench_id]
+                continue
+            box_x1, box_y1 = 20, popup_y
+            box_x2, box_y2 = box_x1 + 520, popup_y + 56
+            overlay = frame.copy()
+            cv2.rectangle(overlay, (box_x1, box_y1),
+                          (box_x2, box_y2), (100, 40, 10), -1)
+            cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
+            cv2.rectangle(frame, (box_x1, box_y1),
+                          (box_x2, box_y2), (255, 140, 0), 2)
+            cv2.putText(frame, f"ALERT  {msg}",
+                        (box_x1 + 10, box_y1 + 22),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 200, 255), 2)
+            cv2.putText(frame, f"Bench {bench_id} flagged for malpractice",
+                        (box_x1 + 10, box_y1 + 46),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, (180, 220, 255), 1)
+            popup_y += 66
+
     return frame
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# MAIN
-# ════════════════════════════════════════════════════════════════════════════
-
+# ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     global _dash_enabled
 
@@ -192,21 +214,21 @@ def main():
         _dash_enabled = False
 
     cfg       = load_config()
-    cam_index = 0 if args.no_cam else cfg.get("camera_index", 1)
-    alert_thr = cfg.get("alert_threshold", 30)
-    conf_thr  = cfg.get("ml_confidence_threshold", 0.65)
+    cam_index = 0 if args.no_cam else cfg.get("camera_index", 0)
+    alert_thr = cfg.get("threshold", 100)
+    conf_thr  = cfg.get("ml_confidence_threshold", 0.75)
 
     print("=" * 55)
-    print("  ARGUS — File 12: Main System v3")
+    print("  ARGUS — File 12: Main System v5 FINAL")
     print("  VIT Pune | CSAIML-E | Group 01")
     print("=" * 55)
-    print(f"\n  Camera:{cam_index} Alert:{alert_thr} "
-          f"Conf:{conf_thr} Dash:{'OFF' if not _dash_enabled else 'ON'}")
+    print(f"\n  Camera   : {cam_index}")
+    print(f"  Threshold: {alert_thr}")
+    print(f"  ML conf  : {conf_thr}")
+    print(f"  Dashboard: {'OFF' if not _dash_enabled else 'ON'}")
 
-    # Start dashboard worker thread
     if _dash_enabled:
-        dash_thread = threading.Thread(target=_dashboard_worker, daemon=True)
-        dash_thread.start()
+        threading.Thread(target=_dashboard_worker, daemon=True).start()
         print("  Dashboard worker started ✓")
 
     print("\n[1/7] PoseDetector...")
@@ -234,14 +256,21 @@ def main():
     cap.set(cv2.CAP_PROP_FPS, 30)
     print("  Camera open ✓\n" + "-"*55)
 
-    frame_count    = 0
-    fps            = 0.0
-    fps_timer      = time.time()
-    paused         = False
-    alerted_set    = set()
-    bench_states   = {}
-    frame_interval = 1.0 / 30.0
-    push_counter   = 0
+    # ── State variables ───────────────────────────────────────────────────────
+    frame_count       = 0
+    fps               = 0.0
+    fps_timer         = time.time()
+    paused            = False
+    confirmed_alerts  = set()      # bench_ids that completed 10s sustained
+    last_alerted_time = {}         # FIX 2: bench_id -> when alert fired
+    alert_popups      = {}         # FIX 3: bench_id -> (msg, timestamp)
+    bench_states      = {}
+    frame_interval    = 1.0 / 30.0
+    push_counter      = 0
+    decay_timer       = time.time()
+    suspicious_since  = {}         # bench_id -> time suspicion started
+    SUSTAINED_SECONDS = 10
+    ALERT_PERSIST_SEC = 30         # FIX 2: alert stays for 30s after firing
 
     while True:
         ret, frame = cap.read()
@@ -249,7 +278,7 @@ def main():
             time.sleep(0.05)
             continue
 
-        frame_count += 1
+        frame_count  += 1
         push_counter += 1
         now = time.time()
         if now - fps_timer >= 1.0:
@@ -259,7 +288,9 @@ def main():
             frame_interval = 1.0 / max(fps, 1.0)
 
         if paused:
-            cv2.imshow("ARGUS", draw_overlay(frame.copy(), bench_states, fps, True))
+            cv2.imshow("ARGUS", draw_overlay(
+                frame.copy(), bench_states, fps, True,
+                alert_thr, confirmed_alerts, alert_popups))
             key = cv2.waitKey(30) & 0xFF
             if key in (ord('q'), ord('Q')): break
             if key in (ord('p'), ord('P')): paused = False
@@ -267,27 +298,28 @@ def main():
 
         h_f, w_f = frame.shape[:2]
 
-        # ── 1. All zones ──────────────────────────────────────────────────
+        # 1. All zones
         try:
             all_zones = zones.get_all_zones()
         except Exception:
-            all_zones = {}
+            all_zones = []
 
-        # ── 2. Motion detection ───────────────────────────────────────────
+        # 2. Motion detection — returns (scores_dict, frame) tuple
         try:
             motion_result = motion.detect(frame, all_zones)
+            if isinstance(motion_result, tuple):
+                motion_scores, frame = motion_result
+            else:
+                motion_scores = motion_result
         except Exception:
-            motion_result = {}
+            motion_scores = {}
 
         def get_motion(bid):
-            if isinstance(motion_result, dict):
-                return float(motion_result.get(bid, 0.0))
-            try:
-                return float(motion_result)
-            except Exception:
-                return 0.0
+            if isinstance(motion_scores, dict):
+                return float(motion_scores.get(bid, 0.0))
+            return 0.0
 
-        # ── 3. Pose detection ─────────────────────────────────────────────
+        # 3. Pose detection — returns (persons, frame) tuple
         try:
             pose_result = pose.detect(frame)
             if isinstance(pose_result, tuple):
@@ -297,15 +329,14 @@ def main():
         except Exception:
             persons = []
 
-        # ── 4. Per-person pipeline ────────────────────────────────────────
+        # 4. Per-person pipeline
         for person in persons:
             if not person:
                 continue
 
-            # FIX 1 — Pass NORMALIZED centroid (0-1) to assign_zone
-            centroid  = person.get("centroid", (0.5, 0.5))
-            cx_norm   = float(centroid[0])   # already 0-1 from pose_detector
-            cy_norm   = float(centroid[1])
+            centroid = person.get("centroid", (0.5, 0.5))
+            cx_norm  = float(centroid[0])
+            cy_norm  = float(centroid[1])
 
             try:
                 bench_id = zones.assign_zone(cx_norm, cy_norm, w_f, h_f)
@@ -337,11 +368,13 @@ def main():
             if features is None:
                 continue
 
-            # scorer needs LIST, classifier needs DICT
-            features_list = features if isinstance(features, list) else list(features.values())
-            FEATURE_KEYS = ["shoulder_angle","head_offset_x","head_offset_y",
-                            "left_wrist_dist","right_wrist_dist",
-                            "wrist_velocity_avg","zone_motion_score"]
+            features_list = features if isinstance(features, list) \
+                            else list(features.values())
+            FEATURE_KEYS = [
+                "shoulder_angle", "head_offset_x", "head_offset_y",
+                "left_wrist_dist", "right_wrist_dist",
+                "wrist_velocity_avg", "zone_motion_score"
+            ]
             features_dict = dict(zip(FEATURE_KEYS, features_list))
             ml_conf = clf.predict(features_dict) if clf.is_ready() else 0.0
 
@@ -354,15 +387,10 @@ def main():
 
             score = scorer.get_score(bench_id)
 
-            # Zone geometry in pixels for overlay
-            zx = int(zone_info.get("x", 0) * w_f) if zone_info.get("x", 0) <= 1 \
-                 else int(zone_info.get("x", 0))
-            zy = int(zone_info.get("y", 0) * h_f) if zone_info.get("y", 0) <= 1 \
-                 else int(zone_info.get("y", 0))
-            zw = int(zone_info.get("w", 0) * w_f) if zone_info.get("w", 0) <= 1 \
-                 else int(zone_info.get("w", 200))
-            zh = int(zone_info.get("h", 0) * h_f) if zone_info.get("h", 0) <= 1 \
-                 else int(zone_info.get("h", 300))
+            zx = int(zone_info.get("x", 0))
+            zy = int(zone_info.get("y", 0))
+            zw = int(zone_info.get("w", 200))
+            zh = int(zone_info.get("h", 300))
 
             bench_states[bench_id] = {
                 "x": zx, "y": zy, "w": zw, "h": zh,
@@ -370,28 +398,59 @@ def main():
                 "student_name": student_name, "roll_number": roll_number,
             }
 
-            # Alert
-            if score >= alert_thr and bench_id not in alerted_set:
-                alerted_set.add(bench_id)
-                snap = save_snapshot(frame, bench_id, roll_number)
-                alert_data = {
-                    "bench": bench_id, "student_name": student_name,
-                    "roll_number": roll_number, "score": score,
-                    "ml_confidence": ml_conf, "snapshot_path": snap,
-                    "flags": features.get("flags", {}) if isinstance(features, dict) else {}
-                }
-                logger.log_alert(**alert_data)
-                push_alert(alert_data)
-                print(f"  [ALERT] {bench_id} | {student_name} | score={score:.0f}")
+            # ── Alert logic ───────────────────────────────────────────────
+            if score >= alert_thr:
+                if bench_id not in suspicious_since:
+                    suspicious_since[bench_id] = now
+                sustained = now - suspicious_since[bench_id]
 
-            elif score < alert_thr and bench_id in alerted_set:
-                alerted_set.discard(bench_id)
+                if sustained >= SUSTAINED_SECONDS \
+                        and bench_id not in confirmed_alerts:
+                    confirmed_alerts.add(bench_id)
+                    last_alerted_time[bench_id] = now
+                    snap = save_snapshot(frame, bench_id, roll_number)
+                    alert_data = {
+                        "bench"        : bench_id,
+                        "student_name" : student_name,
+                        "roll_number"  : roll_number,
+                        "score"        : score,
+                        "ml_confidence": ml_conf,
+                        "snapshot_path": snap,
+                        "flags"        : {}
+                    }
+                    logger.log_alert(**alert_data)
+                    push_alert(alert_data)
+                    alert_popups[bench_id] = (
+                        f"{student_name} ({roll_number})", now)
+                    print(f"  [ALERT] {bench_id} | {student_name} | "
+                          f"score={score:.0f} | sustained={sustained:.1f}s")
+            else:
+                # Score dropped — reset suspicion timer
+                suspicious_since.pop(bench_id, None)
 
-        # ── Draw ──────────────────────────────────────────────────────────
-        display = draw_overlay(frame.copy(), bench_states, fps, False)
+                # FIX 2: Only clear confirmed alert after ALERT_PERSIST_SEC
+                if bench_id in confirmed_alerts:
+                    elapsed = now - last_alerted_time.get(bench_id, now)
+                    if elapsed >= ALERT_PERSIST_SEC:
+                        confirmed_alerts.discard(bench_id)
+                        last_alerted_time.pop(bench_id, None)
+                        print(f"  [CLEAR] {bench_id} alert cleared "
+                              f"after {elapsed:.0f}s")
+
+        # Decay every 8 seconds
+        if now - decay_timer >= 8.0:
+            try:
+                scorer.decay_all()
+            except Exception:
+                pass
+            decay_timer = now
+
+        # Draw overlay
+        display = draw_overlay(frame.copy(), bench_states, fps, False,
+                               alert_thr, confirmed_alerts, alert_popups)
         cv2.imshow("ARGUS", display)
 
-        # FIX 3 — Push every 4th frame via queue (non-blocking)
+        # Push to dashboard every 4th frame
         if _dash_enabled and push_counter % 4 == 0:
             _, jpeg = cv2.imencode(".jpg", display,
                                    [cv2.IMWRITE_JPEG_QUALITY, 50])
@@ -402,7 +461,7 @@ def main():
                 "running"    : True
             })
 
-        # ── Keys ──────────────────────────────────────────────────────────
+        # Keys
         key = cv2.waitKey(1) & 0xFF
         if key in (ord('q'), ord('Q')):
             print("\n  [QUIT]"); break
@@ -410,17 +469,25 @@ def main():
             for bid in list(bench_states.keys()):
                 try: scorer.reset_score(bid)
                 except Exception: pass
-            alerted_set.clear(); bench_states = {}
+            confirmed_alerts.clear()
+            suspicious_since.clear()
+            last_alerted_time.clear()
+            alert_popups.clear()
+            bench_states = {}
             print("  [RESET]")
         elif key in (ord('c'), ord('C')):
-            logger.clear_session(); alerted_set.clear()
+            logger.clear_session()
+            confirmed_alerts.clear()
+            suspicious_since.clear()
+            last_alerted_time.clear()
+            alert_popups.clear()
             print("  [CLEAR]")
         elif key in (ord('s'), ord('S')):
             print(f"  [SNAP] {save_snapshot(frame, 'MANUAL', 'snap')}")
         elif key in (ord('p'), ord('P')):
-            paused = True; print("  [PAUSE]")
+            paused = True
+            print("  [PAUSE]")
 
-    # Stop dashboard worker
     if _dash_enabled:
         try: _dash_queue.put_nowait(None)
         except Exception: pass
@@ -430,8 +497,10 @@ def main():
 
     s = logger.get_summary()
     print("\n" + "="*55)
-    print(f"  Alerts:{s['total_alerts']} Students:{s['unique_students']} "
-          f"Peak:{s['highest_score']} Benches:{s['benches_flagged']}")
+    print(f"  Alerts:{s['total_alerts']} "
+          f"Students:{s['unique_students']} "
+          f"Peak:{s['highest_score']} "
+          f"Benches:{s['benches_flagged']}")
     print("="*55 + "\n  ARGUS session ended.")
 
 
