@@ -1,16 +1,19 @@
 """
-ARGUS — File 12: detection/main.py  [FINAL v5]
+ARGUS — File 12: detection/main.py  [FINAL v6 — Hardware Integration]
 Member 2: Shubham Pitty | VIT Pune CSAIML-E Group 01
 
-Fixes in v5 (over v4):
-  1. ALERT badge now only shows after sustained 10s (not on brief score spike)
-  2. Alert persists for 30s even if score drops below threshold
-  3. Blue popup added — shows for 25s on screen when alert fires
-  4. Config tuning — threshold 100, wrist_dist 1.80, decay_rate 8
+v6 adds over v5:
+  - Arduino hardware integration (Green/Amber/Red LED + Buzzer + LCD)
+  - Green LED on when exam starts
+  - Amber LED when score enters warning zone (60-99)
+  - Red LED + 3 buzzer beeps when alert confirmed (10s sustained)
+  - Hardware runs in background thread — zero FPS impact
+  - If Arduino not connected, system runs normally without hardware
 
 Run: py -3.11 main.py
      py -3.11 main.py --no-dash
      py -3.11 main.py --no-cam
+     py -3.11 main.py --no-hw     (disable hardware)
 Controls: Q=Quit R=Reset C=Clear S=Snapshot P=Pause
 """
 
@@ -37,6 +40,15 @@ from zone_manager        import ZoneManager
 from score_manager       import ScoreManager
 from classifier          import ARGUSClassifier
 from webapp.alert_logger import AlertLogger
+
+# Hardware — optional, graceful fallback if not connected
+try:
+    sys.path.insert(0, _ROOT)
+    from hardware.serial_handler import ARGUSHardware
+    HW_AVAILABLE = True
+except ImportError:
+    HW_AVAILABLE = False
+    print("[HW] serial_handler not found — hardware disabled")
 
 CONFIG_FILE   = os.path.join(_THIS_DIR, "config.json")
 SNAPSHOT_DIR  = os.path.join(_ROOT, "snapshots")
@@ -123,13 +135,8 @@ def push_alert(alert_data):
 # ── Overlay ───────────────────────────────────────────────────────────────────
 def draw_overlay(frame, bench_states, fps, paused,
                  alert_thr, confirmed_alerts, alert_popups):
-    """
-    confirmed_alerts : set of bench_ids that completed sustained 10s check
-    alert_popups     : dict bench_id -> (message, timestamp)
-    """
     h, w = frame.shape[:2]
 
-    # Top bar
     cv2.rectangle(frame, (0, 0), (w, 38), (13, 17, 23), -1)
     status = "PAUSED" if paused else "MONITORING"
     color  = (0, 165, 255) if paused else (63, 185, 80)
@@ -138,44 +145,35 @@ def draw_overlay(frame, bench_states, fps, paused,
     cv2.putText(frame, time.strftime("%H:%M:%S"),
                 (w-90, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (139, 148, 158), 1)
 
-    # Bench boxes
     for bench_id, st in bench_states.items():
         x, y, bw, bh = int(st["x"]), int(st["y"]), int(st["w"]), int(st["h"])
         score     = st.get("score", 0)
-
-        # FIX 1: red only if confirmed sustained alert — not on brief spike
         confirmed = bench_id in confirmed_alerts
         rc = (248, 81, 73) if confirmed else \
              (210, 153, 34) if score >= alert_thr * 0.6 else (63, 185, 80)
 
         cv2.rectangle(frame, (x, y), (x+bw, y+bh), rc, 2)
-
         bar_w = int((min(score, alert_thr) / alert_thr) * bw)
         bar_y = y + bh - 8
         cv2.rectangle(frame, (x, bar_y), (x+bw, y+bh), (33, 38, 45), -1)
         if bar_w > 0:
             cv2.rectangle(frame, (x, bar_y), (x+bar_w, y+bh), rc, -1)
-
         label = f"{bench_id} {st.get('student_name', '')}"
         cv2.rectangle(frame, (x, max(0, y-22)), (x+bw, y), (13, 17, 23), -1)
         cv2.putText(frame, label, (x+4, y-6),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, rc, 1)
         cv2.putText(frame, f"{score:.0f}/{alert_thr}", (x+4, y+bh-12),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.42, (230, 237, 243), 1)
-
-        # ALERT badge — only on confirmed sustained alerts
         if confirmed:
             cv2.rectangle(frame, (x+bw-65, y+4), (x+bw-4, y+22),
                           (248, 81, 73), -1)
             cv2.putText(frame, "ALERT", (x+bw-62, y+17),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1)
 
-    # Bottom bar
     cv2.rectangle(frame, (0, h-24), (w, h), (13, 17, 23), -1)
     cv2.putText(frame, "Q=Quit  R=Reset  C=Clear  S=Snapshot  P=Pause",
                 (8, h-8), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (72, 79, 88), 1)
 
-    # FIX 3: Blue alert popups — show for 25 seconds
     if alert_popups:
         now = time.time()
         popup_y = 50
@@ -209,6 +207,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--no-dash", action="store_true")
     parser.add_argument("--no-cam",  action="store_true")
+    parser.add_argument("--no-hw",   action="store_true")
     args = parser.parse_args()
     if args.no_dash:
         _dash_enabled = False
@@ -217,15 +216,30 @@ def main():
     cam_index = 0 if args.no_cam else cfg.get("camera_index", 0)
     alert_thr = cfg.get("threshold", 100)
     conf_thr  = cfg.get("ml_confidence_threshold", 0.75)
+    warn_thr  = alert_thr * 0.6   # warning zone threshold
 
     print("=" * 55)
-    print("  ARGUS — File 12: Main System v5 FINAL")
+    print("  ARGUS — File 12: Main System v6")
     print("  VIT Pune | CSAIML-E | Group 01")
     print("=" * 55)
     print(f"\n  Camera   : {cam_index}")
     print(f"  Threshold: {alert_thr}")
+    print(f"  Warning  : {warn_thr:.0f}")
     print(f"  ML conf  : {conf_thr}")
     print(f"  Dashboard: {'OFF' if not _dash_enabled else 'ON'}")
+
+    # ── Hardware init ─────────────────────────────────────────────────────────
+    hw = None
+    if HW_AVAILABLE and not args.no_hw:
+        print("\n  Connecting Arduino hardware...")
+        hw = ARGUSHardware()
+        if hw.start():
+            print("  Hardware connected ✓")
+        else:
+            print("  Hardware not found — running without hardware")
+            hw = None
+    else:
+        print("  Hardware: DISABLED")
 
     if _dash_enabled:
         threading.Thread(target=_dashboard_worker, daemon=True).start()
@@ -256,21 +270,26 @@ def main():
     cap.set(cv2.CAP_PROP_FPS, 30)
     print("  Camera open ✓\n" + "-"*55)
 
+    # Signal exam start to hardware
+    if hw:
+        hw.send_exam_start()
+
     # ── State variables ───────────────────────────────────────────────────────
     frame_count       = 0
     fps               = 0.0
     fps_timer         = time.time()
     paused            = False
-    confirmed_alerts  = set()      # bench_ids that completed 10s sustained
-    last_alerted_time = {}         # FIX 2: bench_id -> when alert fired
-    alert_popups      = {}         # FIX 3: bench_id -> (msg, timestamp)
+    confirmed_alerts  = set()
+    last_alerted_time = {}
+    alert_popups      = {}
+    warned_set        = set()   # benches currently in warning state on hardware
     bench_states      = {}
     frame_interval    = 1.0 / 30.0
     push_counter      = 0
     decay_timer       = time.time()
-    suspicious_since  = {}         # bench_id -> time suspicion started
+    suspicious_since  = {}
     SUSTAINED_SECONDS = 10
-    ALERT_PERSIST_SEC = 30         # FIX 2: alert stays for 30s after firing
+    ALERT_PERSIST_SEC = 30
 
     while True:
         ret, frame = cap.read()
@@ -298,13 +317,11 @@ def main():
 
         h_f, w_f = frame.shape[:2]
 
-        # 1. All zones
         try:
             all_zones = zones.get_all_zones()
         except Exception:
             all_zones = []
 
-        # 2. Motion detection — returns (scores_dict, frame) tuple
         try:
             motion_result = motion.detect(frame, all_zones)
             if isinstance(motion_result, tuple):
@@ -319,7 +336,6 @@ def main():
                 return float(motion_scores.get(bid, 0.0))
             return 0.0
 
-        # 3. Pose detection — returns (persons, frame) tuple
         try:
             pose_result = pose.detect(frame)
             if isinstance(pose_result, tuple):
@@ -329,7 +345,6 @@ def main():
         except Exception:
             persons = []
 
-        # 4. Per-person pipeline
         for person in persons:
             if not person:
                 continue
@@ -398,14 +413,20 @@ def main():
                 "student_name": student_name, "roll_number": roll_number,
             }
 
-            # ── Alert logic ───────────────────────────────────────────────
+            # ── Alert + Warning logic ─────────────────────────────────────────
             if score >= alert_thr:
                 if bench_id not in suspicious_since:
                     suspicious_since[bench_id] = now
                 sustained = now - suspicious_since[bench_id]
 
+                # Clear warning LED if we're now in alert territory
+                if bench_id in warned_set and hw:
+                    warned_set.discard(bench_id)
+                    # send_alert will handle WARN_CLEAR internally
+
                 if sustained >= SUSTAINED_SECONDS \
                         and bench_id not in confirmed_alerts:
+                    # ALERT confirmed
                     confirmed_alerts.add(bench_id)
                     last_alerted_time[bench_id] = now
                     snap = save_snapshot(frame, bench_id, roll_number)
@@ -422,18 +443,40 @@ def main():
                     push_alert(alert_data)
                     alert_popups[bench_id] = (
                         f"{student_name} ({roll_number})", now)
+                    # Hardware: Red LED + 3 beeps
+                    if hw:
+                        hw.send_alert(bench_id, student_name)
                     print(f"  [ALERT] {bench_id} | {student_name} | "
                           f"score={score:.0f} | sustained={sustained:.1f}s")
+
+            elif score >= warn_thr:
+                # WARNING zone — amber LED
+                if bench_id not in warned_set \
+                        and bench_id not in confirmed_alerts:
+                    warned_set.add(bench_id)
+                    if hw:
+                        hw.send_warning(bench_id, student_name)
+                    print(f"  [WARN] {bench_id} | {student_name} | "
+                          f"score={score:.0f}")
+
             else:
-                # Score dropped — reset suspicion timer
+                # Score dropped below warning zone
                 suspicious_since.pop(bench_id, None)
 
-                # FIX 2: Only clear confirmed alert after ALERT_PERSIST_SEC
+                # Clear warning state on hardware
+                if bench_id in warned_set:
+                    warned_set.discard(bench_id)
+                    if hw:
+                        hw.send_warn_clear()
+
+                # Clear confirmed alert after ALERT_PERSIST_SEC
                 if bench_id in confirmed_alerts:
                     elapsed = now - last_alerted_time.get(bench_id, now)
                     if elapsed >= ALERT_PERSIST_SEC:
                         confirmed_alerts.discard(bench_id)
                         last_alerted_time.pop(bench_id, None)
+                        if hw:
+                            hw.send_clear()
                         print(f"  [CLEAR] {bench_id} alert cleared "
                               f"after {elapsed:.0f}s")
 
@@ -473,7 +516,9 @@ def main():
             suspicious_since.clear()
             last_alerted_time.clear()
             alert_popups.clear()
+            warned_set.clear()
             bench_states = {}
+            if hw: hw.send_clear()
             print("  [RESET]")
         elif key in (ord('c'), ord('C')):
             logger.clear_session()
@@ -481,12 +526,20 @@ def main():
             suspicious_since.clear()
             last_alerted_time.clear()
             alert_popups.clear()
+            warned_set.clear()
+            if hw: hw.send_clear()
             print("  [CLEAR]")
         elif key in (ord('s'), ord('S')):
             print(f"  [SNAP] {save_snapshot(frame, 'MANUAL', 'snap')}")
         elif key in (ord('p'), ord('P')):
             paused = True
             print("  [PAUSE]")
+
+    # Cleanup
+    if hw:
+        hw.send_exam_stop()
+        time.sleep(1)
+        hw.stop()
 
     if _dash_enabled:
         try: _dash_queue.put_nowait(None)

@@ -1,0 +1,44 @@
+[
+    {
+        "id": 1,
+        "timestamp": "2026-05-19 10:50:52",
+        "date": "2026-05-19",
+        "time": "10:50:52",
+        "bench": "B2",
+        "student_name": "Shatakshi",
+        "roll_number": "1251030199",
+        "score": 100.0,
+        "ml_confidence": 0.017,
+        "flags": {},
+        "snapshot_path": "snapshots/B2_1251030199_001.jpg",
+        "reviewed": false
+    },
+    {
+        "id": 2,
+        "timestamp": "2026-05-19 10:50:53",
+        "date": "2026-05-19",
+        "time": "10:50:53",
+        "bench": "B2",
+        "student_name": "Shatakshi",
+        "roll_number": "1251030199",
+        "score": 100.0,
+        "ml_confidence": 0.017,
+        "flags": {},
+        "snapshot_path": "snapshots/B2_1251030199_001.jpg",
+        "reviewed": true
+    },
+    {
+        "id": 3,
+        "timestamp": "2026-05-19 10:53:03",
+        "date": "2026-05-19",
+        "time": "10:53:03",
+        "bench": "B3",
+        "student_name": "Swayam",
+        "roll_number": "1251030068",
+        "score": 100.0,
+        "ml_confidence": 0.8667,
+        "flags": {},
+        "snapshot_path": "snapshots/B3_1251030068_001.jpg",
+        "reviewed": true
+    }
+]
