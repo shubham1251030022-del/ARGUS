@@ -288,7 +288,7 @@ def main():
     push_counter      = 0
     decay_timer       = time.time()
     suspicious_since  = {}
-    SUSTAINED_SECONDS = 10
+    SUSTAINED_SECONDS = 7
     ALERT_PERSIST_SEC = 30
 
     while True:
