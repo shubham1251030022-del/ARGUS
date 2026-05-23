@@ -1,0 +1,5 @@
+f=open('webapp/app.py','r',encoding='utf-8') 
+t=f.read();f.close() 
+f=open('webapp/app.py','w',encoding='utf-8') 
+f.write(t);f.close() 
+print('Done') 

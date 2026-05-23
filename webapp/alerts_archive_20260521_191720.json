@@ -1,0 +1,16 @@
+[
+    {
+        "id": 1,
+        "timestamp": "2026-05-21 19:16:40",
+        "date": "2026-05-21",
+        "time": "19:16:40",
+        "bench": "B2",
+        "student_name": "Shatakshi",
+        "roll_number": "1251030199",
+        "score": 100.0,
+        "ml_confidence": 0.9083,
+        "flags": {},
+        "snapshot_path": "snapshots/B2_1251030199_001.jpg",
+        "reviewed": true
+    }
+]
