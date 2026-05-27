@@ -1,0 +1,23 @@
+{
+    "B1": {
+        "student_name": "Arya",
+        "roll_number": "1251030275",
+        "room": "101",
+        "bench": "B1",
+        "status": "ACTIVE"
+    },
+    "B2": {
+        "student_name": "Shatakshi",
+        "roll_number": "1251030199",
+        "room": "101",
+        "bench": "B2",
+        "status": "ACTIVE"
+    },
+    "B3": {
+        "student_name": "Swayam",
+        "roll_number": "1251030068",
+        "room": "101",
+        "bench": "B3",
+        "status": "ACTIVE"
+    }
+}

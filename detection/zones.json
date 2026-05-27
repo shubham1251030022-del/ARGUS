@@ -1,26 +1,12 @@
-[
-    {
-        "bench_id": "B1",
-        "name": "Arya",
-        "roll_number": "1251030275",
-        "x1": 0, "y1": 0, "x2": 427, "y2": 720,
-        "x": 0, "y": 0, "w": 427, "h": 720,
-        "status": "ACTIVE", "buffer": 20
-    },
-    {
-        "bench_id": "B2",
-        "name": "Shatakshi",
-        "roll_number": "1251030199",
-        "x1": 427, "y1": 0, "x2": 854, "y2": 720,
-        "x": 427, "y": 0, "w": 427, "h": 720,
-        "status": "ACTIVE", "buffer": 20
-    },
-    {
-        "bench_id": "B3",
-        "name": "Swayam",
-        "roll_number": "1251030022",
-        "x1": 854, "y1": 0, "x2": 1280, "y2": 720,
-        "x": 854, "y": 0, "w": 426, "h": 720,
-        "status": "ACTIVE", "buffer": 20
+{
+    "B1": {
+        "x": 282,
+        "y": 470,
+        "w": 320,
+        "h": 250,
+        "aruco_id": 0,
+        "student_name": "Arya",
+        "status": "ACTIVE",
+        "roll_number": "1251030275"
     }
-]
+}
