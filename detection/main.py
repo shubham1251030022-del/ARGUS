@@ -491,16 +491,24 @@ def main():
 
                 if bench_id in confirmed_alerts:
                     elapsed = now - last_alerted_time.get(bench_id, now)
-                    if elapsed >= ALERT_PERSIST_SEC:
+                    # FIX: clear when score drops below 25 OR after persist time
+                    # Old: only cleared after time — but score was stuck at 100
+                    # New: force reset score + clear when student sits still
+                    if score < 25 or elapsed >= ALERT_PERSIST_SEC:
                         confirmed_alerts.discard(bench_id)
                         last_alerted_time.pop(bench_id, None)
+                        suspicious_since.pop(bench_id, None)
+                        try:
+                            scorer.reset_score(bench_id, "Alert cleared")
+                        except Exception:
+                            pass
                         if hw:
                             hw.send_clear()
-                        print(f"  [CLEAR] {bench_id} alert cleared "
-                              f"after {elapsed:.0f}s")
+                        print(f"  [CLEAR] {bench_id} score={score:.0f} "
+                              f"elapsed={elapsed:.0f}s — alert cleared")
 
-        # Decay every 8 seconds
-        if now - decay_timer >= 8.0:
+        # Decay every 4 seconds (matches score_manager.decay_interval)
+        if now - decay_timer >= 4.0:
             try:
                 scorer.decay_all()
             except Exception:

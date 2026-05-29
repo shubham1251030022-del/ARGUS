@@ -308,6 +308,16 @@ def _aruco_scan_thread():
                     else "Searching... Point camera at ArUco markers"
                 )
 
+            # Push frame to dashboard so feed is visible during scan
+            try:
+                _, jpeg = cv2.imencode(".jpg", frame,
+                    [cv2.IMWRITE_JPEG_QUALITY, 40])
+                with _frame_lock:
+                    global _latest_frame
+                    _latest_frame = jpeg.tobytes()
+            except Exception:
+                pass
+
             if hit_count >= HIT_NEED:
                 zones = last_zones
                 # Merge student names from seating file
@@ -376,6 +386,77 @@ def aruco_status():
 # EXAM CONTROL (launches main.py as subprocess)
 # ════════════════════════════════════════════════════════════════════════════
 
+def _export_session_excel():
+    """
+    Export current session alerts to Excel.
+    Returns file path or None on failure.
+    """
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill, Alignment
+        import datetime
+
+        alerts = logger.get_all()
+        summary = logger.get_summary()
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "ARGUS Session Report"
+
+        # Header styling
+        header_font = Font(bold=True, color="FFFFFF")
+        header_fill = PatternFill("solid", fgColor="1a1a2e")
+
+        # Title row
+        ws.merge_cells("A1:G1")
+        ws["A1"] = f"ARGUS Exam Session Report — {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        ws["A1"].font = Font(bold=True, size=13)
+        ws["A1"].alignment = Alignment(horizontal="center")
+
+        # Summary row
+        ws.merge_cells("A2:G2")
+        ws["A2"] = (f"Total Alerts: {summary.get('total_alerts',0)} | "
+                    f"Students Flagged: {summary.get('unique_students',0)} | "
+                    f"Peak Score: {summary.get('highest_score',0)} | "
+                    f"Benches: {', '.join(summary.get('benches_flagged',[]))}")
+        ws["A2"].font = Font(italic=True)
+
+        # Column headers
+        headers = ["#", "Time", "Bench", "Student", "Roll No", "Score", "ML Conf %"]
+        for col, h in enumerate(headers, 1):
+            cell = ws.cell(row=4, column=col, value=h)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center")
+
+        # Alert rows
+        for row_idx, alert in enumerate(alerts, 5):
+            ws.cell(row=row_idx, column=1, value=alert.get("id", ""))
+            ws.cell(row=row_idx, column=2, value=alert.get("time", ""))
+            ws.cell(row=row_idx, column=3, value=alert.get("bench", ""))
+            ws.cell(row=row_idx, column=4, value=alert.get("student_name", ""))
+            ws.cell(row=row_idx, column=5, value=alert.get("roll_number", ""))
+            ws.cell(row=row_idx, column=6, value=alert.get("score", 0))
+            conf_pct = round(alert.get("ml_confidence", 0) * 100, 1)
+            ws.cell(row=row_idx, column=7, value=conf_pct)
+
+        # Column widths
+        for col, width in zip("ABCDEFG", [5, 10, 8, 20, 15, 8, 10]):
+            ws.column_dimensions[col].width = width
+
+        # Save
+        reports_dir = os.path.join(_ROOT, "reports")
+        os.makedirs(reports_dir, exist_ok=True)
+        fname = f"ARGUS_Report_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        fpath = os.path.join(reports_dir, fname)
+        wb.save(fpath)
+        print(f"[ARGUS] Report saved: {fpath}")
+        return fname, fpath
+    except Exception as e:
+        print(f"[ARGUS] Excel export failed: {e}")
+        return None, None
+
+
 def _ensure_default_zones():
     """
     If zones.json has no coordinates (ArUco not scanned),
@@ -434,6 +515,15 @@ def exam_start():
             return jsonify({"ok": False, "error": "Exam already active"}), 400
 
         try:
+            # Block start if ArUco scan still running (camera conflict)
+            with _aruco_lock:
+                aruco_running = _aruco_state.get("running", False)
+            if aruco_running:
+                return jsonify({
+                    "ok": False,
+                    "error": "ArUco scan still running — wait for it to complete first"
+                }), 400
+
             # Write default zones if ArUco not scanned
             _ensure_default_zones()
 
@@ -451,6 +541,11 @@ def exam_start():
             _exam_active     = True
             _exam_start_time = time.time()
             _set_workflow("EXAM_ACTIVE")
+            # Auto-clear previous session alerts
+            logger.clear_session()
+            with _state_lock:
+                _live_state["benches"] = {}
+                _live_state["frame_count"] = 0
             print(f"[ARGUS] Exam started — main.py PID {_main_process.pid}")
             return jsonify({"ok": True, "pid": _main_process.pid})
         except Exception as e:
@@ -474,7 +569,13 @@ def exam_stop():
                 print(f"[ARGUS] Stop error: {e}")
         _main_process = None
 
-    return jsonify({"ok": True})
+    # Auto-export Excel report
+    fname, fpath = _export_session_excel()
+    return jsonify({
+        "ok": True,
+        "report_file": fname,
+        "report_ready": fname is not None
+    })
 
 
 @app.route("/api/exam/status", methods=["GET"])
@@ -1081,12 +1182,22 @@ async function startExam() {
 }
 
 async function stopExam() {
-  if (!confirm('Stop the exam?')) return;
-  await fetch('/api/exam/stop', {method:'POST'});
+  if (!confirm('Stop the exam? This will generate an Excel report.')) return;
+  const r = await fetch('/api/exam/stop', {method:'POST'});
+  const d = await r.json();
   _examActive = false;
   updateSteps();
   document.getElementById('exam-timer').className = 'exam-timer';
   document.getElementById('exam-label').textContent = 'EXAM ENDED';
+  // Auto-download Excel report
+  if (d.report_ready && d.report_file) {
+    const a = document.createElement('a');
+    a.href = '/api/report/download/' + encodeURIComponent(d.report_file);
+    a.download = d.report_file;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  }
 }
 
 // ── Exam timer ─────────────────────────────────────────────────────────────
@@ -1101,7 +1212,7 @@ async function fetchStatus() {
     const r = await fetch('/api/status');
     const d = await r.json();
     const age  = Date.now()/1000 - (d.last_update || 0);
-    const live = d.running && age < 3;
+    const live = d.running && age < 8;  // FIX: was 3, low FPS caused flicker
 
     document.getElementById('dot').style.background = live ? '#3fb950' : '#484f58';
     document.getElementById('status-text').textContent =
@@ -1252,6 +1363,13 @@ setInterval(fetchAlerts, 2000);
 </body>
 </html>
 """
+
+
+@app.route("/api/report/download/<path:filename>")
+def download_report(filename):
+    """Serve Excel report file for download."""
+    reports_dir = os.path.join(_ROOT, "reports")
+    return send_from_directory(reports_dir, filename, as_attachment=True)
 
 
 @app.route("/")

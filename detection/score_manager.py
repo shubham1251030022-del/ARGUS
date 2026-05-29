@@ -1,18 +1,33 @@
 # score_manager.py — ARGUS Member 1 Swayam Phadtare
-# v3 — Combined-only scoring: single features never trigger alert alone
+# v5 — CAMERA-AWARE scoring
+#
+# KEY INSIGHT from real measurement:
+#   Camera is positioned to the SIDE → shoulder_angle always ~90° for EVERYONE
+#   Shoulder angle is USELESS as a feature in this setup → completely disabled
+#
+# Active features for detection:
+#   - wrist_dist (horizontal) — LWrist_H: 0.04 normal, >0.5 suspicious
+#   - head_offset_x          — normal ~0.15, turning head >0.40
+#   - wrist_velocity         — normal ~5, sudden movement >18
+#   - zone_motion            — background motion
+#
+# Normal sitting measured values:
+#   LWrist_H ≈ 0.04  RWrist_H ≈ 0.27  (safe threshold: 0.50)
+#   head_offset_x ≈ 0.15              (safe threshold: 0.40)
 
-import time, json, os
+import time
+import os
 
 class ScoreManager:
-    def __init__(self, config_file='config.json'):
+    def __init__(self, config_file=None):
         self.scores         = {}
         self.last_event     = {}
         self.last_decay     = {}
         self.alert_fired    = {}
         self.event_log      = []
         self.threshold      = 100
-        self.decay_rate     = 5.0
-        self.decay_interval = 6
+        self.decay_rate     = 8.0   # FIX: was 5 — faster drop when sitting still
+        self.decay_interval = 4     # FIX: was 6 — decay every 4s not 6s
         self.start_time     = time.time()
         self.warmup_seconds = 8
 
@@ -37,14 +52,18 @@ class ScoreManager:
         else:             return 'CLEAR'
 
     def get_status_color(self, bench_id):
-        return {'ALERT':(0,0,255),'WATCH':(0,165,255),
-                'RISING':(0,220,255),'CLEAR':(0,255,0)}[self.get_status(bench_id)]
+        return {
+            'ALERT' : (0,   0,   255),
+            'WATCH' : (0,   165, 255),
+            'RISING': (0,   220, 255),
+            'CLEAR' : (0,   255, 0  ),
+        }[self.get_status(bench_id)]
 
     def check_alert(self, bench_id):
         return self.get_score(bench_id) >= self.threshold
 
     def get_top_benches(self, n=3):
-        return sorted(self.scores.items(), key=lambda x:x[1], reverse=True)[:n]
+        return sorted(self.scores.items(), key=lambda x: x[1], reverse=True)[:n]
 
     def get_event_log(self):
         return self.event_log
@@ -55,59 +74,60 @@ class ScoreManager:
 
         self._init_bench(bench_id)
 
-        shoulder_angle   = features[0]
+        # shoulder_angle = features[0] — DISABLED (always 90° from side camera)
         head_offset_x    = features[1]
-        left_wrist_dist  = features[3]
-        right_wrist_dist = features[4]
+        left_wrist_dist  = features[3]   # horizontal only
+        right_wrist_dist = features[4]   # horizontal only
         wrist_velocity   = features[5]
+
+        # ── Thresholds based on REAL measured values ─────────────────────────
+        # Normal:  LWrist_H≈0.04, RWrist_H≈0.27, head≈0.15
+        # Measured safe margins added on top of normal values
+
+        head_suspicious = head_offset_x    >= 0.40   # normal~0.15, threshold 0.40
+        arm_extended    = (left_wrist_dist  >= 0.55 or
+                           right_wrist_dist >= 0.55)  # normal max~0.27, threshold 0.55
+        fast_wrist      = wrist_velocity   >= 18     # normal~5, threshold 18
+        zone_motion     = motion_score     >= 0.15
 
         points   = 0.0
         behavior = 'NORMAL'
         reasons  = []
 
-        # Individual flags — raised thresholds for 2-3m distance
-        shoulder_suspicious = shoulder_angle   >= 38    # clear body turn
-        head_suspicious     = head_offset_x    >= 0.32  # clear head turn
-        arm_extended        = (left_wrist_dist  >= 0.50 or
-                               right_wrist_dist >= 0.50) # arm reaching out
-        fast_wrist          = wrist_velocity   >= 18    # sudden hand move
-        zone_motion         = motion_score     >= 0.12
+        # ── Scoring patterns (shoulder angle excluded entirely) ───────────────
 
-        # ── ONLY combined patterns score points ──────────────────
-        # Single feature alone = 0 points (prevents false alerts)
-
-        # Pattern 1: Body turn + arm reaching → strongest cheating signal
-        if shoulder_suspicious and arm_extended:
-            points   = 12
-            behavior = 'COMBINED_CHEAT'
-            reasons  = [f"ShoulderTurn({shoulder_angle:.0f}) + ArmReach"]
-
-        # Pattern 2: Head turn + body turn → looking at neighbor
-        elif shoulder_suspicious and head_suspicious:
+        # Pattern 1: Head turn + arm reach → strongest signal without shoulder
+        if head_suspicious and arm_extended:
             points   = 10
-            behavior = 'HEAD_BODY_TURN'
-            reasons  = [f"HeadTurn + ShoulderTurn({shoulder_angle:.0f})"]
+            behavior = 'HEAD_ARM_CHEAT'
+            reasons  = [f"HeadTurn({head_offset_x:.2f}) + "
+                        f"ArmReach(L:{left_wrist_dist:.2f} R:{right_wrist_dist:.2f})"]
 
-        # Pattern 3: Fast hand + arm extended → passing chit
+        # Pattern 2: Fast hand + arm extended → passing chit
         elif fast_wrist and arm_extended:
             points   = 10
             behavior = 'FAST_REACH'
-            reasons  = [f"FastWrist({wrist_velocity:.0f}) + ArmReach"]
+            reasons  = [f"FastWrist({wrist_velocity:.1f}) + ArmReach"]
 
-        # Pattern 4: All three together → highest confidence
-        elif shoulder_suspicious and arm_extended and head_suspicious:
-            points   = 15
-            behavior = 'FULL_CHEAT'
-            reasons  = ["All3: Shoulder+Arm+Head"]
-
-        # Pattern 5: Motion + body turn → sustained suspicious movement
-        elif zone_motion and shoulder_suspicious:
+        # Pattern 3: Head turn + fast wrist → looking + grabbing
+        elif head_suspicious and fast_wrist:
             points   = 8
-            behavior = 'MOTION_TURN'
-            reasons  = [f"ZoneMotion + ShoulderTurn({shoulder_angle:.0f})"]
+            behavior = 'HEAD_FAST'
+            reasons  = [f"HeadTurn({head_offset_x:.2f}) + FastWrist({wrist_velocity:.1f})"]
 
-        # Single features → 0 points (explicitly ignored)
-        # Normal: writing, reading, leaning forward, scratching head
+        # Pattern 4: Zone motion + arm extended
+        elif zone_motion and arm_extended:
+            points   = 7
+            behavior = 'MOTION_REACH'
+            reasons  = [f"ZoneMotion({motion_score:.2f}) + ArmReach"]
+
+        # Pattern 5: Zone motion + head turn
+        elif zone_motion and head_suspicious:
+            points   = 6
+            behavior = 'MOTION_HEAD'
+            reasons  = [f"ZoneMotion({motion_score:.2f}) + HeadTurn({head_offset_x:.2f})"]
+
+        # Single features → 0 points always
 
         if points > 0:
             self.scores[bench_id] = min(
