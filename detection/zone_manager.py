@@ -102,15 +102,15 @@ class ZoneManager:
         """Default 3 zones dividing 1280x720 into equal strips."""
         self.zones = [
             self._normalize_zone('B1', {
-                'x': 0, 'y': 50, 'w': 380, 'h': 620,
+                'x': 20,  'y': 80, 'w': 360, 'h': 580,
                 'student_name': 'Unknown', 'roll_number': ''
             }),
             self._normalize_zone('B2', {
-                'x': 400, 'y': 50, 'w': 380, 'h': 620,
+                'x': 420, 'y': 80, 'w': 360, 'h': 580,
                 'student_name': 'Unknown', 'roll_number': ''
             }),
             self._normalize_zone('B3', {
-                'x': 800, 'y': 50, 'w': 380, 'h': 620,
+                'x': 820, 'y': 80, 'w': 360, 'h': 580,
                 'student_name': 'Unknown', 'roll_number': ''
             }),
         ]

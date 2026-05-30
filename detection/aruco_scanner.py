@@ -34,10 +34,13 @@ ARUCO_ID_MAP = {
     5: "B6"
 }
 
-# ── Bench zone expansion (pixels) around ArUco marker centre ──────────────────
-# FIX: increased — at 2-3m markers are small, zone must be wider
-ZONE_EXPAND_X = 160   # was 120
-ZONE_EXPAND_Y = 210   # was 160
+# ── Bench zone expansion around ArUco marker centre ──────────────────────────
+# Camera at 4-5 feet height, 2-3m horizontal distance (elevated angle)
+# Student's body appears ABOVE the desk marker in image
+# → expand more upward, less downward, wider horizontal for desk width
+ZONE_EXPAND_X    = 180   # horizontal half-width (desk is ~60cm wide)
+ZONE_EXPAND_Y_UP = 320   # expand UP from marker (student body above desk)
+ZONE_EXPAND_Y_DN = 80    # expand DOWN from marker (just below desk level)
 
 # ── Minimum marker size ────────────────────────────────────────────────────────
 # FIX: lowered — at 2-3m markers appear smaller in frame
@@ -164,9 +167,9 @@ class ARUCOScanner:
         cx, cy = marker["centre_x"], marker["centre_y"]
 
         x1 = max(0, cx - ZONE_EXPAND_X)
-        y1 = max(0, cy - ZONE_EXPAND_Y)
+        y1 = max(0, cy - ZONE_EXPAND_Y_UP)   # expand more upward
         x2 = min(w, cx + ZONE_EXPAND_X)
-        y2 = min(h, cy + ZONE_EXPAND_Y)
+        y2 = min(h, cy + ZONE_EXPAND_Y_DN)   # less downward
 
         return {
             "bench"    : ARUCO_ID_MAP[marker_id],

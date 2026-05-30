@@ -315,7 +315,8 @@ def main():
     push_counter      = 0
     decay_timer       = time.time()
     suspicious_since  = {}
-    SUSTAINED_SECONDS = 7
+    SUSTAINED_SECONDS = 2   # FIX: real cheating lasts 2-5 sec not 7+
+    STOP_SIGNAL   = os.path.join(_ROOT, "ARGUS_STOP.signal")
     ALERT_PERSIST_SEC = 30
 
     while True:
@@ -434,9 +435,15 @@ def main():
             zw = int(zone_info.get("w", 200))
             zh = int(zone_info.get("h", 300))
 
+            # FIX: show score=0 during warmup period
+            import time as _t
+            warmup_done = (_t.time() - scorer.start_time) >= scorer.warmup_seconds
+            display_score = score if warmup_done else 0.0
+            display_conf  = ml_conf if warmup_done else 0.0
+
             bench_states[bench_id] = {
                 "x": zx, "y": zy, "w": zw, "h": zh,
-                "score": score, "ml_confidence": ml_conf,
+                "score": display_score, "ml_confidence": display_conf,
                 "student_name": student_name, "roll_number": roll_number,
             }
 
@@ -507,8 +514,8 @@ def main():
                         print(f"  [CLEAR] {bench_id} score={score:.0f} "
                               f"elapsed={elapsed:.0f}s — alert cleared")
 
-        # Decay every 4 seconds (matches score_manager.decay_interval)
-        if now - decay_timer >= 4.0:
+        # Decay every 1 second (matches score_manager.decay_interval)
+        if now - decay_timer >= 1.0:
             try:
                 scorer.decay_all()
             except Exception:
@@ -532,6 +539,15 @@ def main():
         key = cv2.waitKey(1) & 0xFF
         if key in (ord('q'), ord('Q')):
             print("\n  [QUIT]"); break
+
+        # Check for stop signal from dashboard (Stop Exam button)
+        if os.path.exists(STOP_SIGNAL):
+            try:
+                os.remove(STOP_SIGNAL)
+            except Exception:
+                pass
+            print("\n  [STOP] Stop signal received from dashboard")
+            break
         elif key in (ord('r'), ord('R')):
             for bid in list(bench_states.keys()):
                 try: scorer.reset_score(bid)

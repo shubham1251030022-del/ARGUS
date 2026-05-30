@@ -61,6 +61,14 @@ _live_state = {
 _frame_lock   = threading.Lock()
 _latest_frame = None
 
+# ── Session metadata (for report naming) ────────────────────────────────────
+_session_meta = {
+    "division" : "",   # from Division column in Excel
+    "subject"  : "",   # from Subject column in Excel
+    "exam_date": "",   # from Exam Date column, or system date
+    "room"     : "",   # from Room column
+}
+
 # ── Exam state ────────────────────────────────────────────────────────────────
 _exam_lock       = threading.Lock()
 _exam_active     = False
@@ -123,10 +131,14 @@ def _parse_excel(file_bytes):
                     return j
         return None
 
-    col_prn   = find_col(["prn", "roll", "id"])
-    col_name  = find_col(["candidate", "name", "student"])
-    col_bench = find_col(["bench no", "bench_no", "bench"])
-    col_room  = find_col(["room"])
+    col_prn      = find_col(["prn", "roll", "id"])
+    col_name     = find_col(["candidate", "name", "student"])
+    col_bench    = find_col(["bench no", "bench_no", "bench"])
+    col_room     = find_col(["room"])
+    col_class    = find_col(["class", "year", "sem"])   # e.g. SE, TE, BE
+    col_division = find_col(["division", "div"])
+    col_subject  = find_col(["subject", "sub", "exam name", "paper"])
+    col_date     = find_col(["exam date", "date"])
 
     if col_bench is None:
         return None, "Could not find 'Bench No' column in Excel"
@@ -153,7 +165,26 @@ def _parse_excel(file_bytes):
             "status"      : "ACTIVE"
         }
 
-    return result, None
+    # Extract session metadata from first data row
+    import datetime as _dt
+    meta = {"division": "ARGUS", "subject": "Exam",
+            "exam_date": _dt.datetime.now().strftime("%Y%m%d"), "room": ""}
+    if rows:
+        first = rows[0]
+        if col_class is not None and first[col_class]:
+            meta["class"]    = str(first[col_class]).strip()
+        if col_division is not None and first[col_division]:
+            meta["division"] = str(first[col_division]).strip()
+        if col_subject is not None and first[col_subject]:
+            meta["subject"]   = str(first[col_subject]).strip()
+        if col_date is not None and first[col_date]:
+            raw = str(first[col_date]).strip()
+            if raw not in ("None",""):
+                meta["exam_date"] = raw.replace("-","").replace("/","")[:8]
+        if col_room is not None and first[col_room]:
+            meta["room"] = str(first[col_room]).strip()
+
+    return result, None, meta
 
 
 def _update_zones_with_students(seating):
@@ -194,9 +225,13 @@ def seating_upload():
 
     try:
         file_bytes = file.read()
-        seating, err = _parse_excel(file_bytes)
+        seating, err, meta = _parse_excel(file_bytes)
         if err:
             return jsonify({"ok": False, "error": err}), 400
+
+        # Store session metadata from Excel
+        global _session_meta
+        _session_meta.update(meta)
 
         # Save seating JSON
         with open(SEATING_FILE, "w") as f:
@@ -206,11 +241,15 @@ def seating_upload():
         _update_zones_with_students(seating)
 
         _set_workflow("SEATING_READY")
-        print(f"[ARGUS] Seating uploaded — {len(seating)} students assigned")
-        for bid, s in seating.items():
-            print(f"  {bid}: {s['student_name']} ({s['roll_number']})")
+        print(f"[ARGUS] Seating uploaded — {len(seating)} students")
+        print(f"[ARGUS] Session: {_session_meta['division']} | "
+              f"{_session_meta['subject']} | {_session_meta['exam_date']}")
 
-        return jsonify({"ok": True, "seating": seating})
+        return jsonify({
+            "ok"      : True,
+            "seating" : seating,
+            "meta"    : _session_meta
+        })
 
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -409,11 +448,17 @@ def _export_session_excel():
 
         # Title row
         ws.merge_cells("A1:G1")
-        ws["A1"] = f"ARGUS Exam Session Report — {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        div_s  = _session_meta.get("division","")
+        subj_s = _session_meta.get("subject","")
+        title_str = f"ARGUS Exam Report"
+        if div_s:  title_str += f" — {div_s}"
+        if subj_s: title_str += f" | {subj_s}"
+        title_str += f" | {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        ws["A1"] = title_str
         ws["A1"].font = Font(bold=True, size=13)
         ws["A1"].alignment = Alignment(horizontal="center")
 
-        # Summary row
+        # Summary row (row 2 — no note row)
         ws.merge_cells("A2:G2")
         ws["A2"] = (f"Total Alerts: {summary.get('total_alerts',0)} | "
                     f"Students Flagged: {summary.get('unique_students',0)} | "
@@ -422,7 +467,7 @@ def _export_session_excel():
         ws["A2"].font = Font(italic=True)
 
         # Column headers
-        headers = ["#", "Time", "Bench", "Student", "Roll No", "Score", "ML Conf %"]
+        headers = ["#", "Time", "Bench", "Student", "Roll No", "Score", "ML Score % (info only)"]
         for col, h in enumerate(headers, 1):
             cell = ws.cell(row=4, column=col, value=h)
             cell.font = header_font
@@ -444,10 +489,24 @@ def _export_session_excel():
         for col, width in zip("ABCDEFG", [5, 10, 8, 20, 15, 8, 10]):
             ws.column_dimensions[col].width = width
 
-        # Save
+        # Name: Class_Div_Subject.xlsx
+        # Example: CSAIML-E_Data_Structures.xlsx
+        import re
+        def clean(s):
+            return re.sub(r'[\/:*?"<>|]', '', str(s).strip().replace(' ','_'))
+
+        cls  = clean(_session_meta.get("class",    ""))
+        div  = clean(_session_meta.get("division", "ARGUS"))
+        subj = clean(_session_meta.get("subject",  "Exam"))
+
+        # Build name: include class only if present
+        if cls and cls not in div:
+            fname = f"{cls}_{div}_{subj}.xlsx"
+        else:
+            fname = f"{div}_{subj}.xlsx"
+
         reports_dir = os.path.join(_ROOT, "reports")
         os.makedirs(reports_dir, exist_ok=True)
-        fname = f"ARGUS_Report_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         fpath = os.path.join(reports_dir, fname)
         wb.save(fpath)
         print(f"[ARGUS] Report saved: {fpath}")
@@ -490,10 +549,12 @@ def _ensure_default_zones():
         return  # ArUco already done, nothing to do
 
     # Write default zones — 3 equal vertical strips for 1280x720
+    # Default zones for elevated camera (4-5ft height, 2-3m distance)
+    # Frame 1280x720: divide into 3 zones, taller to capture seated students
     default_zones = {
-        "B1": {"x": 0,   "y": 50, "w": 380, "h": 620, "aruco_id": 0},
-        "B2": {"x": 400, "y": 50, "w": 380, "h": 620, "aruco_id": 1},
-        "B3": {"x": 800, "y": 50, "w": 380, "h": 620, "aruco_id": 2},
+        "B1": {"x": 20,  "y": 80, "w": 360, "h": 580, "aruco_id": 0},
+        "B2": {"x": 420, "y": 80, "w": 360, "h": 580, "aruco_id": 1},
+        "B3": {"x": 820, "y": 80, "w": 360, "h": 580, "aruco_id": 2},
     }
     for bench_id, zone in default_zones.items():
         s = seating.get(bench_id, {})
@@ -554,26 +615,47 @@ def exam_start():
 
 @app.route("/api/exam/stop", methods=["POST"])
 def exam_stop():
-    global _exam_active, _main_process
+    global _exam_active, _main_process, _session_meta, _latest_frame
 
+    # FIX: Export FIRST before clearing session metadata
+    fname, fpath = _export_session_excel()
+
+    # FIX: Write stop signal file — main.py watches for this and exits cleanly
+    # terminate() doesn't work with shell=True (kills CMD, not Python)
+    signal_file = os.path.join(_ROOT, "ARGUS_STOP.signal")
+    try:
+        with open(signal_file, "w") as sf:
+            sf.write("stop")
+        print("[ARGUS] Stop signal written — main.py will exit cleanly")
+    except Exception as se:
+        print(f"[ARGUS] Signal write error: {se}")
+
+    # Also terminate subprocess as fallback
     with _exam_lock:
         _exam_active = False
-        _set_workflow("EXAM_ENDED")
-
+        _set_workflow("IDLE")
         if _main_process and _main_process.poll() is None:
             try:
                 _main_process.terminate()
-                _main_process.wait(timeout=5)
-                print(f"[ARGUS] main.py terminated (PID {_main_process.pid})")
-            except Exception as e:
-                print(f"[ARGUS] Stop error: {e}")
+            except Exception:
+                pass
         _main_process = None
+        # Clear session meta AFTER export
+        _session_meta = {"division":"","subject":"","exam_date":"","room":""}
 
-    # Auto-export Excel report
-    fname, fpath = _export_session_excel()
+    # Force detection offline on dashboard immediately
+    # NOTE: benches NOT cleared here — scores stay visible for teacher review
+    # Scores clear automatically on next Start Exam
+    with _state_lock:
+        _live_state["running"]     = False
+        _live_state["fps"]         = 0
+        _live_state["last_update"] = 0
+    with _frame_lock:
+        _latest_frame = None
+
     return jsonify({
-        "ok": True,
-        "report_file": fname,
+        "ok"          : True,
+        "report_file" : fname,
         "report_ready": fname is not None
     })
 
@@ -1189,6 +1271,27 @@ async function stopExam() {
   updateSteps();
   document.getElementById('exam-timer').className = 'exam-timer';
   document.getElementById('exam-label').textContent = 'EXAM ENDED';
+
+  // FIX: immediately show detection offline — don't wait for age check
+  document.getElementById('dot').style.background = '#484f58';
+  document.getElementById('status-text').textContent = 'Standby';
+  document.getElementById('fps-tag').textContent = '';
+  const badge = document.getElementById('det-badge');
+  if (badge) {
+    badge.textContent = 'DETECTION OFFLINE';
+    badge.className = 'det-badge off';
+  }
+  // Clear bench scores on dashboard
+  ['B1','B2','B3'].forEach(b => {
+    const card = document.getElementById('bench-' + b);
+    if (card) card.className = 'bench-card';
+    const bar = document.getElementById('bar-' + b);
+    if (bar) { bar.style.width = '0%'; bar.className = 'bar'; }
+    const sc = document.getElementById('score-' + b);
+    if (sc) sc.textContent = '0 / 100';
+    const cf = document.getElementById('conf-' + b);
+    if (cf) cf.textContent = '—';
+  });
   // Auto-download Excel report
   if (d.report_ready && d.report_file) {
     const a = document.createElement('a');
@@ -1324,31 +1427,30 @@ async function clearSession() {
 }
 
 // ── Load existing seating on page load ────────────────────────────────────
+// FIX: Does NOT auto-advance workflow — teacher must upload fresh each session
+// Only shows previous data as reference (greyed out)
 async function loadExistingSeating() {
   try {
     const r = await fetch('/api/seating');
     const d = await r.json();
     if (!Object.keys(d).length) return;
 
-    _seatingDone = true;
-    document.getElementById('seating-status').textContent =
-      Object.keys(d).length + ' students assigned';
-    document.getElementById('seating-status').style.color = '#3fb950';
-
+    // Show previous data for reference but don't mark step as done
     const tbody = document.getElementById('seating-tbody');
     tbody.innerHTML = Object.entries(d).map(([bench, s]) =>
-      `<tr><td><b>${bench}</b></td><td>${s.student_name}</td>
-       <td style="color:#484f58">${s.roll_number}</td></tr>`
+      `<tr style="opacity:0.5">
+        <td><b>${bench}</b></td>
+        <td>${s.student_name}</td>
+        <td style="color:#484f58">${s.roll_number}</td>
+      </tr>`
     ).join('');
 
-    Object.entries(d).forEach(([bench, s]) => {
-      const nameEl = document.getElementById('name-' + bench);
-      const rollEl = document.getElementById('roll-' + bench);
-      if (nameEl) { nameEl.textContent = s.student_name; nameEl.classList.remove('awaiting'); }
-      if (rollEl) rollEl.textContent = s.roll_number;
-    });
+    document.getElementById('seating-status').textContent =
+      'Previous session data — please upload fresh file';
+    document.getElementById('seating-status').style.color = '#8b949e';
 
-    updateSteps();
+    // Do NOT set _seatingDone = true
+    // Teacher must upload Excel to start new session
   } catch(e) {}
 }
 
