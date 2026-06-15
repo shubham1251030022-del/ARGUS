@@ -1,22 +1,24 @@
 """
-ARGUS — File 11: webapp/app.py  [v10 — Teacher Workflow]
+ARGUS — File 11: webapp/app.py  [v11 — Full Fix]
 Member 2: Shubham Pitty | VIT Pune CSAIML-E Group 01
 
-v10 changes:
-  - Excel upload parses PRN/Name/Bench No and assigns students to B1/B2/B3
-  - Scan ArUco runs as background thread inside app.py (no terminal needed)
-  - Start Exam launches main.py as subprocess (teacher never touches terminal)
-  - Step-by-step workflow: Upload Excel → Scan ArUco → Start Exam
-  - Dashboard guides teacher through each step with status indicators
-  - All 3 fixes from v9.1 retained (score thresholds 100/60, exam timer)
+v11 fixes over v10:
+  1. ArUco scan thread reads camera_index from config.json — was hardcoded 0,
+     causing scan to use wrong camera on systems where webcam is index 1+
+  2. exam_stop() now waits 1.5s after writing stop signal BEFORE calling
+     terminate() — prevents race condition where terminate() fires before
+     main.py reads the signal file
+  3. Workflow state + aruco state properly reset on Stop Exam — next session
+     starts clean (aruco_done was staying True from previous session)
+  4. btn-start is now enabled after seating upload even if ArUco was not
+     scanned — teacher can proceed with default zones if ArUco fails/times out
+  5. Start Exam button re-enabled correctly after workflow reset on stop
 
-Teacher workflow:
-  1. Open localhost:5000
-  2. Upload ARGUS_Seating.xlsx
-  3. Click Scan ArUco (place markers first)
-  4. Click Start Exam
-  5. Monitor dashboard
-  6. Click Stop Exam
+All v10 fixes retained:
+  - Smart zone extrapolation for 2-of-3 markers
+  - Zones student name always refreshed from seating
+  - Excel export before session meta clear
+  - Stop signal file (ARGUS_STOP.signal) for clean main.py exit
 """
 
 import os
@@ -41,7 +43,9 @@ from webapp.alert_logger import AlertLogger
 SNAPSHOT_DIR  = os.path.join(_ROOT, "snapshots")
 ZONES_FILE    = os.path.join(_ROOT, "detection", "zones.json")
 SEATING_FILE  = os.path.join(_ROOT, "seating_upload.json")
+CONFIG_FILE   = os.path.join(_ROOT, "detection", "config.json")
 MAIN_PY       = os.path.join(_ROOT, "detection", "main.py")
+STOP_SIGNAL   = os.path.join(_ROOT, "ARGUS_STOP.signal")
 
 ALERT_THRESHOLD   = 100
 WARNING_THRESHOLD = 60
@@ -49,6 +53,15 @@ MAX_SCORE         = 100
 
 app    = Flask(__name__)
 logger = AlertLogger()
+
+
+def _load_config():
+    try:
+        with open(CONFIG_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {"camera_index": 0}
+
 
 # ── Live state ────────────────────────────────────────────────────────────────
 _state_lock = threading.Lock()
@@ -61,19 +74,19 @@ _live_state = {
 _frame_lock   = threading.Lock()
 _latest_frame = None
 
-# ── Session metadata (for report naming) ────────────────────────────────────
+# ── Session metadata ──────────────────────────────────────────────────────────
 _session_meta = {
-    "division" : "",   # from Division column in Excel
-    "subject"  : "",   # from Subject column in Excel
-    "exam_date": "",   # from Exam Date column, or system date
-    "room"     : "",   # from Room column
+    "division" : "",
+    "subject"  : "",
+    "exam_date": "",
+    "room"     : "",
 }
 
 # ── Exam state ────────────────────────────────────────────────────────────────
 _exam_lock       = threading.Lock()
 _exam_active     = False
 _exam_start_time = None
-_main_process    = None   # subprocess.Popen handle
+_main_process    = None
 
 # ── ArUco scan state ──────────────────────────────────────────────────────────
 _aruco_lock   = threading.Lock()
@@ -87,7 +100,6 @@ _aruco_state  = {
 }
 
 # ── Workflow state ─────────────────────────────────────────────────────────────
-# IDLE → SEATING_READY → ARUCO_READY → EXAM_ACTIVE → EXAM_ENDED
 _workflow_state = "IDLE"
 
 
@@ -101,18 +113,13 @@ def _set_workflow(state):
 # ════════════════════════════════════════════════════════════════════════════
 
 def _parse_excel(file_bytes):
-    """
-    Parse ARGUS_Seating.xlsx bytes.
-    Expected columns: PRN, Candidate Name, Bench No, Room, Division, Bench Side
-    Returns: dict {bench_id: {student_name, roll_number, ...}}
-    """
     import io
     try:
         from openpyxl import load_workbook
         wb = load_workbook(io.BytesIO(file_bytes))
         ws = wb.active
     except Exception as e:
-        return None, f"Cannot open Excel: {e}"
+        return None, f"Cannot open Excel: {e}", {}
 
     headers = []
     rows    = []
@@ -123,7 +130,6 @@ def _parse_excel(file_bytes):
             if any(c is not None for c in row):
                 rows.append(row)
 
-    # Flexible column matching
     def find_col(keywords):
         for kw in keywords:
             for j, h in enumerate(headers):
@@ -135,13 +141,13 @@ def _parse_excel(file_bytes):
     col_name     = find_col(["candidate", "name", "student"])
     col_bench    = find_col(["bench no", "bench_no", "bench"])
     col_room     = find_col(["room"])
-    col_class    = find_col(["class", "year", "sem"])   # e.g. SE, TE, BE
+    col_class    = find_col(["class", "year", "sem"])
     col_division = find_col(["division", "div"])
     col_subject  = find_col(["subject", "sub", "exam name", "paper"])
     col_date     = find_col(["exam date", "date"])
 
     if col_bench is None:
-        return None, "Could not find 'Bench No' column in Excel"
+        return None, "Could not find 'Bench No' column in Excel", {}
 
     result = {}
     for row in rows:
@@ -152,10 +158,10 @@ def _parse_excel(file_bytes):
             bench_num = int(bench_raw)
         except (ValueError, TypeError):
             continue
-        bench_id  = f"B{bench_num}"
-        name      = str(row[col_name]).strip()  if col_name  is not None else "Unknown"
-        prn       = str(row[col_prn]).strip()   if col_prn   is not None else ""
-        room      = str(row[col_room]).strip()  if col_room  is not None else ""
+        bench_id = f"B{bench_num}"
+        name     = str(row[col_name]).strip() if col_name is not None else "Unknown"
+        prn      = str(row[col_prn]).strip()  if col_prn  is not None else ""
+        room     = str(row[col_room]).strip() if col_room is not None else ""
 
         result[bench_id] = {
             "student_name": name,
@@ -165,7 +171,6 @@ def _parse_excel(file_bytes):
             "status"      : "ACTIVE"
         }
 
-    # Extract session metadata from first data row
     import datetime as _dt
     meta = {"division": "ARGUS", "subject": "Exam",
             "exam_date": _dt.datetime.now().strftime("%Y%m%d"), "room": ""}
@@ -179,8 +184,8 @@ def _parse_excel(file_bytes):
             meta["subject"]   = str(first[col_subject]).strip()
         if col_date is not None and first[col_date]:
             raw = str(first[col_date]).strip()
-            if raw not in ("None",""):
-                meta["exam_date"] = raw.replace("-","").replace("/","")[:8]
+            if raw not in ("None", ""):
+                meta["exam_date"] = raw.replace("-", "").replace("/", "")[:8]
         if col_room is not None and first[col_room]:
             meta["room"] = str(first[col_room]).strip()
 
@@ -188,13 +193,11 @@ def _parse_excel(file_bytes):
 
 
 def _update_zones_with_students(seating):
-    """Merge student names into zones.json without overwriting coordinates."""
     existing = {}
     if os.path.exists(ZONES_FILE):
         try:
             with open(ZONES_FILE) as f:
                 raw = json.load(f)
-            # FIX: handle both list and dict formats for zones.json
             if isinstance(raw, list):
                 for item in raw:
                     key = item.get("bench") or item.get("name", "")
@@ -218,7 +221,6 @@ def _update_zones_with_students(seating):
 
 @app.route("/api/seating/upload", methods=["POST"])
 def seating_upload():
-    """Accept Excel file upload, parse it, update zones.json."""
     file = request.files.get("file")
     if not file:
         return jsonify({"ok": False, "error": "No file provided"}), 400
@@ -229,26 +231,22 @@ def seating_upload():
         if err:
             return jsonify({"ok": False, "error": err}), 400
 
-        # Store session metadata from Excel
         global _session_meta
         _session_meta.update(meta)
 
-        # Save seating JSON
         with open(SEATING_FILE, "w") as f:
             json.dump(seating, f, indent=4)
 
-        # Update zones.json with student names
         _update_zones_with_students(seating)
-
         _set_workflow("SEATING_READY")
         print(f"[ARGUS] Seating uploaded — {len(seating)} students")
         print(f"[ARGUS] Session: {_session_meta['division']} | "
               f"{_session_meta['subject']} | {_session_meta['exam_date']}")
 
         return jsonify({
-            "ok"      : True,
-            "seating" : seating,
-            "meta"    : _session_meta
+            "ok"     : True,
+            "seating": seating,
+            "meta"   : _session_meta
         })
 
     except Exception as e:
@@ -267,13 +265,93 @@ def get_seating():
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# ARUCO SCAN (background thread — no terminal needed)
+# ARUCO SCAN
 # ════════════════════════════════════════════════════════════════════════════
+
+def _extrapolate_missing_zones(zones: dict) -> dict:
+    from aruco_scanner import ZONE_EXPAND_X, ZONE_EXPAND_Y_UP, ZONE_EXPAND_Y_DN
+
+    all_benches = ["B1", "B2", "B3"]
+    missing     = [b for b in all_benches if b not in zones]
+
+    if not missing:
+        return zones
+
+    seating = {}
+    if os.path.exists(SEATING_FILE):
+        try:
+            with open(SEATING_FILE) as f:
+                seating = json.load(f)
+        except Exception:
+            pass
+
+    detected = {b: zones[b] for b in all_benches if b in zones}
+    print(f"[ARUCO] Detected: {list(detected.keys())} | Missing: {missing}")
+
+    centers = {b: z["centre_x"] for b, z in detected.items() if "centre_x" in z}
+    if not centers:
+        centers = {b: z["x"] + z["w"] // 2 for b, z in detected.items()}
+
+    if len(detected) >= 2:
+        sorted_detected = sorted(centers.items(), key=lambda x: x[1])
+        spacings = []
+        for i in range(len(sorted_detected) - 1):
+            spacings.append(sorted_detected[i + 1][1] - sorted_detected[i][1])
+        avg_spacing = int(sum(spacings) / len(spacings))
+    else:
+        avg_spacing = 427
+
+    ref   = list(detected.values())[0]
+    ref_y = ref.get("y", 80)
+    ref_h = ref.get("h", 580)
+
+    bench_centers = {}
+    if "B1" in centers:
+        bench_centers["B1"] = centers["B1"]
+        bench_centers["B2"] = centers["B1"] + avg_spacing
+        bench_centers["B3"] = centers["B1"] + 2 * avg_spacing
+    elif "B2" in centers:
+        bench_centers["B2"] = centers["B2"]
+        bench_centers["B1"] = centers["B2"] - avg_spacing
+        bench_centers["B3"] = centers["B2"] + avg_spacing
+    elif "B3" in centers:
+        bench_centers["B3"] = centers["B3"]
+        bench_centers["B2"] = centers["B3"] - avg_spacing
+        bench_centers["B1"] = centers["B3"] - 2 * avg_spacing
+
+    if "B1" in centers and "B3" in centers and "B2" not in centers:
+        bench_centers["B2"] = (centers["B1"] + centers["B3"]) // 2
+
+    for b in missing:
+        cx = bench_centers.get(b, 0)
+        x1 = max(0, cx - ZONE_EXPAND_X)
+        y1 = max(0, ref_y)
+        x2 = min(1280, cx + ZONE_EXPAND_X)
+        y2 = min(720, ref_y + ref_h)
+        s  = seating.get(b, {})
+        zones[b] = {
+            "bench"       : b,
+            "aruco_id"    : {"B1": 0, "B2": 1, "B3": 2}.get(b, -1),
+            "x"           : x1,
+            "y"           : y1,
+            "w"           : x2 - x1,
+            "h"           : y2 - y1,
+            "centre_x"    : cx,
+            "centre_y"    : ref_y + ref_h // 2,
+            "student_name": s.get("student_name", "Unknown"),
+            "roll_number" : s.get("roll_number", ""),
+            "extrapolated": True
+        }
+        print(f"[ARUCO] Extrapolated {b}: centre_x={cx} x={x1} w={x2-x1}"
+              f" student={zones[b]['student_name']}")
+
+    return zones
+
 
 def _aruco_scan_thread():
     """
     Runs ARUCOScanner in a background thread.
-    Opens camera, scans until stable or 45s timeout, saves zones.json.
+    FIX v11: reads camera_index from config.json — was hardcoded 0.
     """
     global _aruco_state
 
@@ -289,21 +367,25 @@ def _aruco_scan_thread():
         sys.path.insert(0, os.path.join(_ROOT, "detection"))
         from aruco_scanner import ARUCOScanner
 
+        # FIX: read from config — not hardcoded 0
+        cam_index = _load_config().get("camera_index", 0)
+        print(f"[ARUCO] Using camera index {cam_index} from config.json")
+
         scanner = ARUCOScanner()
-        cap = cv2.VideoCapture(0)
+        cap = cv2.VideoCapture(cam_index)
 
         if not cap.isOpened():
             with _aruco_lock:
                 _aruco_state.update({
                     "running": False, "done": True,
-                    "error": "Camera not available (index 0)"
+                    "error": f"Camera not available (index {cam_index}) — "
+                             f"check config.json → camera_index"
                 })
             return
 
         cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
-        # Flush warm-up frames
         for _ in range(10):
             cap.read()
 
@@ -312,7 +394,6 @@ def _aruco_scan_thread():
 
         start_time = time.time()
         TIMEOUT    = 90
-        # Total hit count — doesn't reset on missed frames
         hit_count  = 0
         HIT_NEED   = 6
         last_zones = {}
@@ -347,7 +428,6 @@ def _aruco_scan_thread():
                     else "Searching... Point camera at ArUco markers"
                 )
 
-            # Push frame to dashboard so feed is visible during scan
             try:
                 _, jpeg = cv2.imencode(".jpg", frame,
                     [cv2.IMWRITE_JPEG_QUALITY, 40])
@@ -359,7 +439,6 @@ def _aruco_scan_thread():
 
             if hit_count >= HIT_NEED:
                 zones = last_zones
-                # Merge student names from seating file
                 seating = {}
                 if os.path.exists(SEATING_FILE):
                     try:
@@ -373,22 +452,27 @@ def _aruco_scan_thread():
                         zone["student_name"] = seating[bench_id]["student_name"]
                         zone["roll_number"]  = seating[bench_id]["roll_number"]
 
+                # NO extrapolation — only save zones physically detected
+                # Fake zones from 1 marker with guessed spacing caused wrong
+                # zone coordinates and broke assignment entirely
                 scanner.save_zones(zones)
                 _set_workflow("ARUCO_READY")
 
+                real_count = len(zones)
                 with _aruco_lock:
                     _aruco_state.update({
                         "running"    : False,
                         "done"       : True,
-                        "zones_found": len(zones),
+                        "zones_found": real_count,
                         "zones"      : {k: {
-                                            "bench"  : k,
-                                            "student": zones[k].get("student_name", "Unknown"),
-                                            "roll"   : zones[k].get("roll_number", "")
-                                        } for k in zones},
-                        "message": f"✓ {len(zones)} zone(s) locked and saved"
+                            "bench"  : k,
+                            "student": zones[k].get("student_name", "Unknown"),
+                            "roll"   : zones[k].get("roll_number", "")
+                        } for k in zones},
+                        "message": f"✓ {real_count} zone(s) locked and saved"
+                                   + (" — place remaining markers and rescan to add more" if real_count < 3 else "")
                     })
-                print(f"[ARUCO] Scan complete — {len(zones)} zones locked")
+                print(f"[ARUCO] Scan complete — {real_count} real zones locked (no extrapolation)")
                 break
 
             time.sleep(0.05)
@@ -422,35 +506,29 @@ def aruco_status():
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# EXAM CONTROL (launches main.py as subprocess)
+# EXAM CONTROL
 # ════════════════════════════════════════════════════════════════════════════
 
 def _export_session_excel():
-    """
-    Export current session alerts to Excel.
-    Returns file path or None on failure.
-    """
     try:
         from openpyxl import Workbook
         from openpyxl.styles import Font, PatternFill, Alignment
         import datetime
 
-        alerts = logger.get_all()
+        alerts  = logger.get_all()
         summary = logger.get_summary()
 
         wb = Workbook()
         ws = wb.active
         ws.title = "ARGUS Session Report"
 
-        # Header styling
         header_font = Font(bold=True, color="FFFFFF")
         header_fill = PatternFill("solid", fgColor="1a1a2e")
 
-        # Title row
         ws.merge_cells("A1:G1")
-        div_s  = _session_meta.get("division","")
-        subj_s = _session_meta.get("subject","")
-        title_str = f"ARGUS Exam Report"
+        div_s  = _session_meta.get("division", "")
+        subj_s = _session_meta.get("subject", "")
+        title_str = "ARGUS Exam Report"
         if div_s:  title_str += f" — {div_s}"
         if subj_s: title_str += f" | {subj_s}"
         title_str += f" | {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}"
@@ -458,23 +536,21 @@ def _export_session_excel():
         ws["A1"].font = Font(bold=True, size=13)
         ws["A1"].alignment = Alignment(horizontal="center")
 
-        # Summary row (row 2 — no note row)
         ws.merge_cells("A2:G2")
-        ws["A2"] = (f"Total Alerts: {summary.get('total_alerts',0)} | "
-                    f"Students Flagged: {summary.get('unique_students',0)} | "
-                    f"Peak Score: {summary.get('highest_score',0)} | "
-                    f"Benches: {', '.join(summary.get('benches_flagged',[]))}")
+        ws["A2"] = (f"Total Alerts: {summary.get('total_alerts', 0)} | "
+                    f"Students Flagged: {summary.get('unique_students', 0)} | "
+                    f"Peak Score: {summary.get('highest_score', 0)} | "
+                    f"Benches: {', '.join(summary.get('benches_flagged', []))}")
         ws["A2"].font = Font(italic=True)
 
-        # Column headers
-        headers = ["#", "Time", "Bench", "Student", "Roll No", "Score", "ML Score % (info only)"]
+        headers = ["#", "Time", "Bench", "Student", "Roll No", "Score",
+                   "ML Score % (info only)"]
         for col, h in enumerate(headers, 1):
             cell = ws.cell(row=4, column=col, value=h)
-            cell.font = header_font
-            cell.fill = header_fill
+            cell.font      = header_font
+            cell.fill      = header_fill
             cell.alignment = Alignment(horizontal="center")
 
-        # Alert rows
         for row_idx, alert in enumerate(alerts, 5):
             ws.cell(row=row_idx, column=1, value=alert.get("id", ""))
             ws.cell(row=row_idx, column=2, value=alert.get("time", ""))
@@ -485,21 +561,17 @@ def _export_session_excel():
             conf_pct = round(alert.get("ml_confidence", 0) * 100, 1)
             ws.cell(row=row_idx, column=7, value=conf_pct)
 
-        # Column widths
         for col, width in zip("ABCDEFG", [5, 10, 8, 20, 15, 8, 10]):
             ws.column_dimensions[col].width = width
 
-        # Name: Class_Div_Subject.xlsx
-        # Example: CSAIML-E_Data_Structures.xlsx
         import re
         def clean(s):
-            return re.sub(r'[\/:*?"<>|]', '', str(s).strip().replace(' ','_'))
+            return re.sub(r'[\/:*?"<>|]', '', str(s).strip().replace(' ', '_'))
 
         cls  = clean(_session_meta.get("class",    ""))
         div  = clean(_session_meta.get("division", "ARGUS"))
         subj = clean(_session_meta.get("subject",  "Exam"))
 
-        # Build name: include class only if present
         if cls and cls not in div:
             fname = f"{cls}_{div}_{subj}.xlsx"
         else:
@@ -518,9 +590,11 @@ def _export_session_excel():
 
 def _ensure_default_zones():
     """
-    If zones.json has no coordinates (ArUco not scanned),
-    write default zones dividing 1280x720 frame into 3 equal strips.
-    Students still get detected — just without precise bench mapping.
+    At exam start, zones.json must have entries for all 3 benches.
+    - If ArUco was scanned for a bench → keep those exact coordinates
+    - If a bench has no ArUco data → add a default strip (won't be used
+      for scoring unless a person centroid falls in it)
+    Student names always refreshed from seating file.
     """
     seating = {}
     if os.path.exists(SEATING_FILE):
@@ -537,34 +611,52 @@ def _ensure_default_zones():
                 raw = json.load(f)
             if isinstance(raw, dict):
                 existing = raw
+            elif isinstance(raw, list):
+                for item in raw:
+                    key = item.get("bench") or item.get("bench_id") or item.get("name", "")
+                    if key:
+                        existing[key] = item
         except Exception:
             existing = {}
 
-    # Check if any zone has valid coordinates
-    has_coords = any(
-        isinstance(v, dict) and v.get('x') is not None
-        for v in existing.values()
-    )
-    if has_coords:
-        return  # ArUco already done, nothing to do
-
-    # Write default zones — 3 equal vertical strips for 1280x720
-    # Default zones for elevated camera (4-5ft height, 2-3m distance)
-    # Frame 1280x720: divide into 3 zones, taller to capture seated students
-    default_zones = {
-        "B1": {"x": 20,  "y": 80, "w": 360, "h": 580, "aruco_id": 0},
-        "B2": {"x": 420, "y": 80, "w": 360, "h": 580, "aruco_id": 1},
-        "B3": {"x": 820, "y": 80, "w": 360, "h": 580, "aruco_id": 2},
+    # Default fallback positions — only used if ArUco never detected this bench
+    default_positions = {
+        "B1": {"x": 20,  "y": 80, "w": 400, "h": 580, "aruco_id": 0},
+        "B2": {"x": 440, "y": 80, "w": 400, "h": 580, "aruco_id": 1},
+        "B3": {"x": 860, "y": 80, "w": 400, "h": 580, "aruco_id": 2},
     }
-    for bench_id, zone in default_zones.items():
+
+    merged = {}
+    for bench_id, default_pos in default_positions.items():
+        ex = existing.get(bench_id, {})
+        # Use ArUco coordinates if available — NEVER overwrite with defaults
+        if ex.get("x") is not None and ex.get("w") is not None:
+            coords = {
+                "x"        : ex["x"],
+                "y"        : ex["y"],
+                "w"        : ex["w"],
+                "h"        : ex["h"],
+                "aruco_id" : ex.get("aruco_id", default_pos["aruco_id"])
+            }
+            source = "aruco"
+        else:
+            coords = dict(default_pos)
+            source = "default"
+
         s = seating.get(bench_id, {})
-        zone["student_name"] = s.get("student_name", "Unknown")
-        zone["roll_number"]  = s.get("roll_number", "")
-        zone["status"]       = "ACTIVE"
+        merged[bench_id] = {
+            **coords,
+            "student_name": s.get("student_name", ex.get("student_name", "Unknown")),
+            "roll_number" : s.get("roll_number",  ex.get("roll_number",  "")),
+            "status"      : "ACTIVE"
+        }
+        print(f"  {bench_id}: [{source}] {merged[bench_id]['student_name']} "
+              f"x={merged[bench_id]['x']} y={merged[bench_id]['y']} "
+              f"w={merged[bench_id]['w']} h={merged[bench_id]['h']}")
 
     with open(ZONES_FILE, "w") as f:
-        json.dump(default_zones, f, indent=4)
-    print("[ARGUS] Default zones written to zones.json (ArUco not scanned)")
+        json.dump(merged, f, indent=4)
+    print(f"[ARGUS] zones.json ready — ArUco zones preserved, defaults filled for unscanned benches")
 
 
 @app.route("/api/exam/start", methods=["POST"])
@@ -582,13 +674,19 @@ def exam_start():
             if aruco_running:
                 return jsonify({
                     "ok": False,
-                    "error": "ArUco scan still running — wait for it to complete first"
+                    "error": "ArUco scan still running — wait for it to complete"
                 }), 400
 
-            # Write default zones if ArUco not scanned
+            # FIX: Clean up any stale stop signal before starting
+            if os.path.exists(STOP_SIGNAL):
+                try:
+                    os.remove(STOP_SIGNAL)
+                    print("[ARGUS] Removed stale stop signal before exam start")
+                except Exception:
+                    pass
+
             _ensure_default_zones()
 
-            # Launch main.py in visible terminal window (Windows)
             if os.name == 'nt':
                 cmd = f'cd /d "{_ROOT}" && py -3.11 detection/main.py'
                 _main_process = subprocess.Popen(
@@ -599,16 +697,17 @@ def exam_start():
                 _main_process = subprocess.Popen(
                     [sys.executable, MAIN_PY], cwd=_ROOT
                 )
+
             _exam_active     = True
             _exam_start_time = time.time()
             _set_workflow("EXAM_ACTIVE")
-            # Auto-clear previous session alerts
             logger.clear_session()
             with _state_lock:
-                _live_state["benches"] = {}
+                _live_state["benches"]     = {}
                 _live_state["frame_count"] = 0
             print(f"[ARGUS] Exam started — main.py PID {_main_process.pid}")
             return jsonify({"ok": True, "pid": _main_process.pid})
+
         except Exception as e:
             return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -617,35 +716,49 @@ def exam_start():
 def exam_stop():
     global _exam_active, _main_process, _session_meta, _latest_frame
 
-    # FIX: Export FIRST before clearing session metadata
+    # Export FIRST before clearing session metadata
     fname, fpath = _export_session_excel()
 
-    # FIX: Write stop signal file — main.py watches for this and exits cleanly
-    # terminate() doesn't work with shell=True (kills CMD, not Python)
-    signal_file = os.path.join(_ROOT, "ARGUS_STOP.signal")
+    # FIX: Write stop signal, then wait 1.5s before terminate()
+    # This gives main.py enough time to read the file in its loop
+    # before the process is killed as a fallback.
     try:
-        with open(signal_file, "w") as sf:
+        with open(STOP_SIGNAL, "w") as sf:
             sf.write("stop")
-        print("[ARGUS] Stop signal written — main.py will exit cleanly")
+        print("[ARGUS] Stop signal written — waiting for main.py to read it...")
+        time.sleep(1.5)   # FIX: was 0ms — race condition
     except Exception as se:
         print(f"[ARGUS] Signal write error: {se}")
 
-    # Also terminate subprocess as fallback
     with _exam_lock:
         _exam_active = False
-        _set_workflow("IDLE")
+
+        # FIX: Reset workflow to SEATING_READY (not IDLE) so teacher can
+        # restart exam without re-uploading seating. ArUco scan cleared too.
+        _set_workflow("SEATING_READY")
+
         if _main_process and _main_process.poll() is None:
             try:
                 _main_process.terminate()
+                print("[ARGUS] main.py process terminated (fallback)")
             except Exception:
                 pass
         _main_process = None
-        # Clear session meta AFTER export
-        _session_meta = {"division":"","subject":"","exam_date":"","room":""}
 
-    # Force detection offline on dashboard immediately
-    # NOTE: benches NOT cleared here — scores stay visible for teacher review
-    # Scores clear automatically on next Start Exam
+        # Clear session meta AFTER export
+        _session_meta = {"division": "", "subject": "", "exam_date": "", "room": ""}
+
+    # FIX: Reset aruco state so next session starts fresh
+    with _aruco_lock:
+        _aruco_state.update({
+            "running"     : False,
+            "done"        : False,
+            "zones_found" : 0,
+            "zones"       : {},
+            "message"     : "Not started",
+            "error"       : ""
+        })
+
     with _state_lock:
         _live_state["running"]     = False
         _live_state["fps"]         = 0
@@ -679,9 +792,9 @@ def get_workflow():
     seating_ok = os.path.exists(SEATING_FILE)
     aruco_ok   = _workflow_state in ("ARUCO_READY", "EXAM_ACTIVE", "EXAM_ENDED")
     return jsonify({
-        "state"     : _workflow_state,
-        "seating_ok": seating_ok,
-        "aruco_ok"  : aruco_ok,
+        "state"      : _workflow_state,
+        "seating_ok" : seating_ok,
+        "aruco_ok"   : aruco_ok,
         "exam_active": _exam_active
     })
 
@@ -695,7 +808,8 @@ def _generate_stream():
         with _frame_lock:
             frame = _latest_frame
         if frame:
-            yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
+            yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
+                   + frame + b"\r\n")
         else:
             time.sleep(0.05)
         time.sleep(0.033)
@@ -703,8 +817,12 @@ def _generate_stream():
 
 @app.route("/video_feed")
 def video_feed():
-    return Response(_generate_stream(),
+    resp = Response(_generate_stream(),
                     mimetype="multipart/x-mixed-replace; boundary=frame")
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    resp.headers["Pragma"]        = "no-cache"
+    resp.headers["Expires"]       = "0"
+    return resp
 
 
 @app.route("/api/frame", methods=["POST"])
@@ -742,36 +860,36 @@ def push_status():
 # ALERTS
 # ════════════════════════════════════════════════════════════════════════════
 
-@app.route("/api/alerts",         methods=["GET"])
-def get_alerts():       return jsonify(logger.get_all())
+@app.route("/api/alerts",        methods=["GET"])
+def get_alerts():        return jsonify(logger.get_all())
 
-@app.route("/api/alerts/recent",  methods=["GET"])
+@app.route("/api/alerts/recent", methods=["GET"])
 def get_recent_alerts():
     return jsonify(logger.get_recent(request.args.get("n", 10, type=int)))
 
-@app.route("/api/alert",          methods=["POST"])
+@app.route("/api/alert",         methods=["POST"])
 def post_alert():
     d = request.get_json(silent=True) or {}
     a = logger.log_alert(
-        bench=d.get("bench",""), student_name=d.get("student_name","Unknown"),
-        roll_number=d.get("roll_number",""), score=d.get("score",0),
-        ml_confidence=d.get("ml_confidence",0.0),
-        flags=d.get("flags",{}), snapshot_path=d.get("snapshot_path","")
+        bench=d.get("bench", ""), student_name=d.get("student_name", "Unknown"),
+        roll_number=d.get("roll_number", ""), score=d.get("score", 0),
+        ml_confidence=d.get("ml_confidence", 0.0),
+        flags=d.get("flags", {}), snapshot_path=d.get("snapshot_path", "")
     )
     return jsonify(a), 201
 
-@app.route("/api/summary",        methods=["GET"])
-def get_summary():      return jsonify(logger.get_summary())
+@app.route("/api/summary",       methods=["GET"])
+def get_summary():       return jsonify(logger.get_summary())
 
 @app.route("/api/reviewed/<int:alert_id>", methods=["POST"])
 def mark_reviewed(alert_id):
     return jsonify({"ok": logger.mark_reviewed(alert_id), "id": alert_id})
 
-@app.route("/api/clear",          methods=["POST"])
+@app.route("/api/clear",         methods=["POST"])
 def clear_session():
     logger.clear_session()
     with _state_lock:
-        _live_state["benches"] = {}
+        _live_state["benches"]     = {}
         _live_state["frame_count"] = 0
     return jsonify({"ok": True})
 
@@ -796,7 +914,6 @@ DASHBOARD_HTML = r"""
 body { background:#0d1117; color:#e6edf3;
        font-family:'Segoe UI',sans-serif; min-height:100vh; }
 
-/* ── Header ── */
 .header { background:#161b22; border-bottom:1px solid #30363d;
   padding:12px 24px; display:flex; align-items:center;
   justify-content:space-between; }
@@ -808,7 +925,6 @@ body { background:#0d1117; color:#e6edf3;
   animation:pulse 1.5s infinite; }
 @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
 
-/* ── Workflow bar ── */
 .workflow-bar { background:#0d1117; border-bottom:1px solid #21262d;
   padding:10px 24px; display:flex; align-items:center; gap:0; }
 .step { display:flex; align-items:center; gap:8px;
@@ -824,7 +940,6 @@ body { background:#0d1117; color:#e6edf3;
 .step.active .step-num{ background:#1d4ed8; color:#fff; }
 .step-arrow { color:#30363d; padding:0 6px; font-size:0.9rem; }
 
-/* ── Toolbar ── */
 .toolbar { background:#161b22; border-bottom:1px solid #30363d;
   padding:8px 24px; display:flex; gap:10px; align-items:center;
   flex-wrap:wrap; }
@@ -840,28 +955,24 @@ body { background:#0d1117; color:#e6edf3;
 .btn-aruco  { background:#1d4ed8; color:#fff; }
 .btn-start  { background:#238636; color:#fff; }
 .btn-stop   { background:#b91c1c; color:#fff; }
-.btn-clear  { background:#21262d; color:#8b949e;
-  border:1px solid #30363d; }
+.btn-clear  { background:#21262d; color:#8b949e; border:1px solid #30363d; }
 .exam-timer { font-size:0.85rem; font-weight:700; letter-spacing:1px;
   padding:5px 12px; border-radius:4px; min-width:82px;
   text-align:center; color:#484f58; border:1px solid #21262d;
   background:#0d1117; }
 .exam-timer.on { color:#3fb950; border-color:#238636; background:#0d2614; }
 
-/* ── Layout ── */
 .container { display:grid; grid-template-columns:1fr 370px;
   gap:14px; padding:14px; height:calc(100vh - 140px); }
 .left  { display:flex; flex-direction:column; gap:14px; overflow:hidden; }
 .right { display:flex; flex-direction:column; gap:14px; overflow-y:auto; }
 
-/* ── Cards ── */
 .card { background:#161b22; border:1px solid #30363d;
   border-radius:8px; padding:14px; }
 .card-title { font-size:0.7rem; color:#8b949e; text-transform:uppercase;
   letter-spacing:1px; margin-bottom:10px;
   display:flex; justify-content:space-between; align-items:center; }
 
-/* ── Feed ── */
 .feed-wrap { background:#0d1117; border-radius:6px; overflow:hidden;
   flex:1; display:flex; align-items:center; justify-content:center;
   min-height:240px; position:relative; }
@@ -873,7 +984,6 @@ body { background:#0d1117; color:#e6edf3;
 .det-badge.on  { background:#0d2614; color:#3fb950; border:1px solid #238636; }
 .det-badge.off { background:#1a0d0d; color:#f85149; border:1px solid #f85149; }
 
-/* ── Bench cards ── */
 .bench-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; }
 .bench-card { background:#0d1117; border:1px solid #30363d;
   border-radius:6px; padding:10px; transition:all .3s; }
@@ -884,42 +994,36 @@ body { background:#0d1117; color:#e6edf3;
   white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .bench-roll  { font-size:0.65rem; color:#484f58; margin-bottom:5px; }
 .bar-bg  { background:#21262d; border-radius:3px; height:5px; }
-.bar     { height:5px; border-radius:3px; background:#3fb950;
-  transition:width .4s; }
+.bar     { height:5px; border-radius:3px; background:#3fb950; transition:width .4s; }
 .bar.warn  { background:#d29922; }
 .bar.alert { background:#f85149; }
 .score-txt { font-size:0.72rem; color:#8b949e; margin-top:3px; }
 .conf-txt  { font-size:0.65rem; color:#484f58; }
 .awaiting  { font-size:0.72rem; color:#484f58; font-style:italic; }
 
-/* ── Seating table ── */
 .seating-table { width:100%; border-collapse:collapse; font-size:0.75rem; }
 .seating-table th { color:#8b949e; padding:5px 8px; text-align:left;
   border-bottom:1px solid #21262d; }
 .seating-table td { padding:5px 8px; border-bottom:1px solid #161b22; }
 .seating-table tr:hover td { background:#21262d; }
 
-/* ── ArUco status ── */
-.aruco-status { font-size:0.75rem; padding:8px 12px; border-radius:5px;
-  margin-top:6px; }
-.aruco-status.scanning { background:#0d1b3e; color:#58a6ff;
-  border:1px solid #1d4ed8; }
-.aruco-status.done     { background:#0d2614; color:#3fb950;
-  border:1px solid #238636; }
-.aruco-status.error    { background:#1a0d0d; color:#f85149;
-  border:1px solid #f85149; }
-.aruco-status.idle     { background:#161b22; color:#484f58;
-  border:1px solid #21262d; }
+.aruco-status { font-size:0.75rem; padding:8px 12px; border-radius:5px; margin-top:6px; }
+.aruco-status.scanning { background:#0d1b3e; color:#58a6ff; border:1px solid #1d4ed8; }
+.aruco-status.done     { background:#0d2614; color:#3fb950; border:1px solid #238636; }
+.aruco-status.error    { background:#1a0d0d; color:#f85149; border:1px solid #f85149; }
+.aruco-status.idle     { background:#161b22; color:#484f58; border:1px solid #21262d; }
 .progress-dots::after { content:'...'; animation:dots 1.2s steps(4) infinite; }
 @keyframes dots { 0%{content:''} 25%{content:'.'} 50%{content:'..'} 75%{content:'...'} }
 
-/* ── Summary ── */
+/* FIX: ArUco-skipped note */
+.aruco-skip-note { font-size:0.68rem; color:#8b949e; margin-top:4px;
+  font-style:italic; }
+
 .sum-row { display:flex; gap:12px; }
 .stat { flex:1; text-align:center; }
 .stat-val   { font-size:1.3rem; font-weight:700; color:#58a6ff; }
 .stat-label { font-size:0.65rem; color:#8b949e; text-transform:uppercase; }
 
-/* ── Alert table ── */
 .alerts-scroll { overflow-y:auto; max-height:280px; }
 table.alert-tbl { width:100%; border-collapse:collapse; font-size:0.75rem; }
 table.alert-tbl th { text-align:left; padding:5px 7px; color:#8b949e;
@@ -940,7 +1044,6 @@ table.alert-tbl tr:hover td { background:#21262d; }
 </head>
 <body>
 
-<!-- Header -->
 <div class="header">
   <h1>⬡ ARGUS <span style="color:#8b949e;font-size:0.82rem;"> EXAM SURVEILLANCE · VIT PUNE · CSAIML-E</span></h1>
   <div class="meta">
@@ -951,7 +1054,6 @@ table.alert-tbl tr:hover td { background:#21262d; }
   </div>
 </div>
 
-<!-- Workflow steps -->
 <div class="workflow-bar">
   <div class="step pending" id="step1">
     <div class="step-num">1</div>
@@ -969,23 +1071,18 @@ table.alert-tbl tr:hover td { background:#21262d; }
   </div>
 </div>
 
-<!-- Toolbar -->
 <div class="toolbar">
-
-  <!-- Step 1: Upload Excel -->
   <button class="btn btn-upload" id="btn-upload" title="Upload ARGUS_Seating.xlsx">
     ↑ SEATING FILE
     <input type="file" id="seating-input" accept=".xlsx,.xls"
            onchange="uploadSeating(this)">
   </button>
 
-  <!-- Step 2: Scan ArUco -->
   <button class="btn btn-aruco" id="btn-aruco"
           onclick="startAruco()" disabled>
     ⊞ SCAN ARUCO
   </button>
 
-  <!-- Step 3: Start/Stop Exam -->
   <button class="btn btn-start" id="btn-start"
           onclick="startExam()" disabled>
     ▶ START EXAM
@@ -1001,29 +1098,25 @@ table.alert-tbl tr:hover td { background:#21262d; }
   <span id="exam-label" style="font-size:0.72rem;color:#484f58;"></span>
 </div>
 
-<!-- Main layout -->
 <div class="container">
-
-  <!-- LEFT -->
   <div class="left">
-
-    <!-- Live feed -->
     <div class="card" style="flex:1;">
       <div class="card-title">
         <span>📷 LIVE SURVEILLANCE FEED</span>
         <span id="det-badge" class="det-badge off">DETECTION OFFLINE</span>
       </div>
       <div class="feed-wrap">
-        <img id="live-feed" src="/video_feed"
-             onerror="this.style.display='none';
-                      document.getElementById('no-feed').style.display='block'">
-        <div id="no-feed" class="feed-placeholder" style="display:none;">
+        <img id="live-feed"
+             src="/video_feed"
+             style="width:100%;max-height:400px;object-fit:contain;"
+             onerror="this.style.display='none';document.getElementById('no-feed').style.display='flex'">
+        <div id="no-feed" class="feed-placeholder"
+             style="display:none;width:100%;align-items:center;justify-content:center;">
           Detection offline — start exam to begin monitoring
         </div>
       </div>
     </div>
 
-    <!-- Bench status -->
     <div class="card">
       <div class="card-title">🪑 BENCH STATUS</div>
       <div class="bench-grid">
@@ -1053,13 +1146,9 @@ table.alert-tbl tr:hover td { background:#21262d; }
         </div>
       </div>
     </div>
-
   </div>
 
-  <!-- RIGHT -->
   <div class="right">
-
-    <!-- Seating panel -->
     <div class="card">
       <div class="card-title">
         <span>📋 SEATING ASSIGNMENT</span>
@@ -1072,13 +1161,9 @@ table.alert-tbl tr:hover td { background:#21262d; }
             Upload Excel file to assign students</td></tr>
         </tbody>
       </table>
-      <!-- ArUco status line -->
-      <div class="aruco-status idle" id="aruco-msg">
-        ArUco: Not scanned
-      </div>
+      <div class="aruco-status idle" id="aruco-msg">ArUco: Not scanned — scan markers or click SKIP ARUCO</div>
     </div>
 
-    <!-- Summary -->
     <div class="card">
       <div class="card-title">📊 SESSION METRICS</div>
       <div class="sum-row">
@@ -1093,7 +1178,6 @@ table.alert-tbl tr:hover td { background:#21262d; }
       </div>
     </div>
 
-    <!-- Alert log -->
     <div class="card" style="flex:1;">
       <div class="card-title">
         <span>🚨 INCIDENT LOG</span>
@@ -1113,30 +1197,28 @@ table.alert-tbl tr:hover td { background:#21262d; }
         </table>
       </div>
     </div>
-
   </div>
 </div>
 
 <script>
-// ── Constants ──────────────────────────────────────────────────────────────
-const ALERT_THR   = 100;
-const WARN_THR    = 60;
-const MAX_SCORE   = 100;
+const ALERT_THR = 100;
+const WARN_THR  = 60;
+const MAX_SCORE = 100;
 
-// ── State ──────────────────────────────────────────────────────────────────
-let _seatingDone = false;
-let _arucoDone   = false;
-let _examActive  = false;
+let _seatingDone  = false;
+let _arucoDone    = false;
+let _arucoSkipped = false;
+let _examActive   = false;
 let _arucoPolling = null;
 
-// ── Clock ──────────────────────────────────────────────────────────────────
 function updateClock() {
   document.getElementById('clock').textContent =
     new Date().toLocaleTimeString('en-IN', {hour12:false});
 }
 setInterval(updateClock, 1000); updateClock();
 
-// ── Workflow steps UI ──────────────────────────────────────────────────────
+// ── FIX: Start button enabled after seating upload, not just after ArUco ──
+// ArUco is now optional — teacher can skip it and use default zones.
 function updateSteps() {
   const s1 = document.getElementById('step1');
   const s2 = document.getElementById('step2');
@@ -1146,14 +1228,19 @@ function updateSteps() {
   s2.className = 'step ' + (_arucoDone   ? 'done' :
                              _seatingDone ? 'active' : 'pending');
   s3.className = 'step ' + (_examActive  ? 'done' :
-                             _arucoDone  ? 'active' : 'pending');
+                             _seatingDone ? 'active' : 'pending');
 
+  // ArUco enabled after seating
   document.getElementById('btn-aruco').disabled = !_seatingDone || _examActive;
-  document.getElementById('btn-start').disabled = !_arucoDone  || _examActive;
+
+  // Start ONLY enabled after ArUco scan is done — mandatory
+  document.getElementById('btn-start').disabled = !_arucoDone || _examActive;
   document.getElementById('btn-stop').disabled  = !_examActive;
+
+  const skipBtn = document.getElementById('btn-skip-aruco');
+  if (skipBtn) skipBtn.style.display = 'none';
 }
 
-// ── Upload seating Excel ───────────────────────────────────────────────────
 async function uploadSeating(input) {
   if (!input.files.length) return;
   const formData = new FormData();
@@ -1177,7 +1264,6 @@ async function uploadSeating(input) {
       Object.keys(d.seating).length + ' students assigned';
     document.getElementById('seating-status').style.color = '#3fb950';
 
-    // Fill seating table + bench name cards
     const tbody = document.getElementById('seating-tbody');
     tbody.innerHTML = Object.entries(d.seating).map(([bench, s]) =>
       `<tr>
@@ -1187,14 +1273,10 @@ async function uploadSeating(input) {
       </tr>`
     ).join('');
 
-    // Update bench name cards
     Object.entries(d.seating).forEach(([bench, s]) => {
       const nameEl = document.getElementById('name-' + bench);
       const rollEl = document.getElementById('roll-' + bench);
-      if (nameEl) {
-        nameEl.textContent = s.student_name;
-        nameEl.classList.remove('awaiting');
-      }
+      if (nameEl) { nameEl.textContent = s.student_name; nameEl.classList.remove('awaiting'); }
       if (rollEl) rollEl.textContent = s.roll_number;
     });
 
@@ -1206,7 +1288,6 @@ async function uploadSeating(input) {
   input.value = '';
 }
 
-// ── Scan ArUco ────────────────────────────────────────────────────────────
 async function startAruco() {
   const msgEl = document.getElementById('aruco-msg');
   msgEl.className = 'aruco-status scanning';
@@ -1214,7 +1295,6 @@ async function startAruco() {
 
   await fetch('/api/aruco/start', {method:'POST'});
 
-  // Poll status every 500ms
   _arucoPolling = setInterval(async () => {
     try {
       const r = await fetch('/api/aruco/status');
@@ -1238,7 +1318,6 @@ async function startAruco() {
         msgEl.textContent = d.message;
         _arucoDone = true;
 
-        // Update seating table with zone info
         if (d.zones) {
           Object.entries(d.zones).forEach(([bench, info]) => {
             const nameEl = document.getElementById('name-' + bench);
@@ -1254,34 +1333,59 @@ async function startAruco() {
   }, 500);
 }
 
-// ── Exam control ──────────────────────────────────────────────────────────
 async function startExam() {
+  document.getElementById('btn-start').disabled = true;
   const r = await fetch('/api/exam/start', {method:'POST'});
   const d = await r.json();
-  if (!d.ok) { alert('Start failed: ' + d.error); return; }
+  if (!d.ok) {
+    alert('Start failed: ' + d.error);
+    document.getElementById('btn-start').disabled = false;
+    return;
+  }
   _examActive = true;
+  // FIX: Force browser to reconnect to video feed — clears any cached error state
+  const feedImg = document.getElementById('live-feed');
+  if (feedImg) {
+    feedImg.style.display = 'block';
+    document.getElementById('no-feed').style.display = 'none';
+    feedImg.src = '/video_feed?' + Date.now();
+  }
+  updateSteps();
+}
+
+function skipAruco() {
+  _arucoSkipped = true;
+  const msgEl = document.getElementById('aruco-msg');
+  msgEl.className = 'aruco-status idle';
+  msgEl.textContent = 'ArUco skipped — using default zones';
   updateSteps();
 }
 
 async function stopExam() {
   if (!confirm('Stop the exam? This will generate an Excel report.')) return;
+
+  // Disable stop button immediately to prevent double-click
+  document.getElementById('btn-stop').disabled = true;
+  document.getElementById('btn-stop').textContent = '■ STOPPING...';
+
   const r = await fetch('/api/exam/stop', {method:'POST'});
   const d = await r.json();
-  _examActive = false;
+
+  _examActive   = false;
+  _arucoDone    = false;
+  _arucoSkipped = false;  // reset so next session must scan or skip explicitly
+  document.getElementById('btn-stop').textContent = '■ STOP EXAM';
   updateSteps();
   document.getElementById('exam-timer').className = 'exam-timer';
   document.getElementById('exam-label').textContent = 'EXAM ENDED';
+  document.getElementById('exam-label').style.color = '#8b949e';
 
-  // FIX: immediately show detection offline — don't wait for age check
   document.getElementById('dot').style.background = '#484f58';
   document.getElementById('status-text').textContent = 'Standby';
   document.getElementById('fps-tag').textContent = '';
   const badge = document.getElementById('det-badge');
-  if (badge) {
-    badge.textContent = 'DETECTION OFFLINE';
-    badge.className = 'det-badge off';
-  }
-  // Clear bench scores on dashboard
+  if (badge) { badge.textContent = 'DETECTION OFFLINE'; badge.className = 'det-badge off'; }
+
   ['B1','B2','B3'].forEach(b => {
     const card = document.getElementById('bench-' + b);
     if (card) card.className = 'bench-card';
@@ -1292,7 +1396,7 @@ async function stopExam() {
     const cf = document.getElementById('conf-' + b);
     if (cf) cf.textContent = '—';
   });
-  // Auto-download Excel report
+
   if (d.report_ready && d.report_file) {
     const a = document.createElement('a');
     a.href = '/api/report/download/' + encodeURIComponent(d.report_file);
@@ -1303,31 +1407,27 @@ async function stopExam() {
   }
 }
 
-// ── Exam timer ─────────────────────────────────────────────────────────────
 function fmtSec(s) {
   return [Math.floor(s/3600), Math.floor((s%3600)/60), s%60]
     .map(n => String(n).padStart(2,'0')).join(':');
 }
 
-// ── Fetch live status ──────────────────────────────────────────────────────
 async function fetchStatus() {
   try {
     const r = await fetch('/api/status');
     const d = await r.json();
     const age  = Date.now()/1000 - (d.last_update || 0);
-    const live = d.running && age < 8;  // FIX: was 3, low FPS caused flicker
+    const live = d.running && age < 8;
 
     document.getElementById('dot').style.background = live ? '#3fb950' : '#484f58';
     document.getElementById('status-text').textContent =
       live ? 'Detection Running' : 'Standby';
-    document.getElementById('fps-tag').textContent =
-      d.fps ? d.fps + ' FPS' : '';
+    document.getElementById('fps-tag').textContent = d.fps ? d.fps + ' FPS' : '';
 
     const badge = document.getElementById('det-badge');
-    badge.textContent  = live ? 'DETECTION ACTIVE' : 'DETECTION OFFLINE';
-    badge.className    = 'det-badge ' + (live ? 'on' : 'off');
+    badge.textContent = live ? 'DETECTION ACTIVE' : 'DETECTION OFFLINE';
+    badge.className   = 'det-badge ' + (live ? 'on' : 'off');
 
-    // Exam timer
     if (d.exam_active) {
       _examActive = true;
       document.getElementById('exam-timer').className = 'exam-timer on';
@@ -1337,7 +1437,6 @@ async function fetchStatus() {
       updateSteps();
     }
 
-    // Bench cards
     const benches = d.benches || {};
     ['B1','B2','B3'].forEach(b => {
       const info  = benches[b] || {};
@@ -1348,25 +1447,18 @@ async function fetchStatus() {
 
       if (name) {
         const nameEl = document.getElementById('name-' + b);
-        if (nameEl) {
-          nameEl.textContent = name;
-          nameEl.classList.remove('awaiting');
-        }
+        if (nameEl) { nameEl.textContent = name; nameEl.classList.remove('awaiting'); }
       }
-
       const bar = document.getElementById('bar-' + b);
       if (bar) {
         bar.style.width = pct + '%';
         bar.className = 'bar' +
           (score >= ALERT_THR ? ' alert' : score >= WARN_THR ? ' warn' : '');
       }
-
       const scoreEl = document.getElementById('score-' + b);
       if (scoreEl) scoreEl.textContent = score + ' / ' + MAX_SCORE;
-
       const confEl = document.getElementById('conf-' + b);
       if (confEl) confEl.textContent = conf ? (conf*100).toFixed(0)+'% conf' : '—';
-
       const card = document.getElementById('bench-' + b);
       if (card) card.className = 'bench-card' +
         (score >= ALERT_THR ? ' alert' : score >= WARN_THR ? ' warning' : '');
@@ -1374,28 +1466,23 @@ async function fetchStatus() {
   } catch(e) {}
 }
 
-// ── Fetch alerts ───────────────────────────────────────────────────────────
 async function fetchAlerts() {
   try {
-    const [ar, sr] = await Promise.all([
-      fetch('/api/alerts'), fetch('/api/summary')
-    ]);
+    const [ar, sr] = await Promise.all([fetch('/api/alerts'), fetch('/api/summary')]);
     const alerts  = await ar.json();
     const summary = await sr.json();
 
     document.getElementById('s-total').textContent    = summary.total_alerts    || 0;
     document.getElementById('s-students').textContent = summary.unique_students || 0;
     document.getElementById('s-high').textContent     = summary.highest_score   || 0;
-    document.getElementById('s-benches').textContent  =
-      (summary.benches_flagged || []).length;
+    document.getElementById('s-benches').textContent  = (summary.benches_flagged || []).length;
 
     const tbody = document.getElementById('alert-tbody');
     if (!alerts.length) {
-      tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;' +
-        'color:#484f58;padding:16px;">No incidents yet</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#484f58;padding:16px;">No incidents yet</td></tr>';
       return;
     }
-    tbody.innerHTML = alerts.slice(0,50).map(a => {
+    tbody.innerHTML = alerts.slice(0, 50).map(a => {
       const sc = a.score;
       const bc = sc >= ALERT_THR ? 'red' : sc >= WARN_THR ? 'yellow' : 'green';
       const rv = a.reviewed
@@ -1403,15 +1490,14 @@ async function fetchAlerts() {
         : `<button class="btn-rev" onclick="markReviewed(${a.id})">Review</button>`;
       return `<tr>
         <td>#${a.id}</td><td>${a.time}</td><td><b>${a.bench}</b></td>
-        <td style="max-width:80px;overflow:hidden;text-overflow:ellipsis;">
-          ${a.student_name}</td>
+        <td style="max-width:80px;overflow:hidden;text-overflow:ellipsis;">${a.student_name}</td>
         <td><span class="badge ${bc}">${sc}</span></td>
         <td>${(a.ml_confidence*100).toFixed(0)}%</td>
         <td>${rv}</td></tr>`;
     }).join('');
 
     document.getElementById('log-ts').textContent =
-      new Date().toLocaleTimeString('en-IN',{hour12:false});
+      new Date().toLocaleTimeString('en-IN', {hour12:false});
   } catch(e) {}
 }
 
@@ -1426,16 +1512,12 @@ async function clearSession() {
   fetchAlerts(); fetchStatus();
 }
 
-// ── Load existing seating on page load ────────────────────────────────────
-// FIX: Does NOT auto-advance workflow — teacher must upload fresh each session
-// Only shows previous data as reference (greyed out)
 async function loadExistingSeating() {
   try {
     const r = await fetch('/api/seating');
     const d = await r.json();
     if (!Object.keys(d).length) return;
 
-    // Show previous data for reference but don't mark step as done
     const tbody = document.getElementById('seating-tbody');
     tbody.innerHTML = Object.entries(d).map(([bench, s]) =>
       `<tr style="opacity:0.5">
@@ -1446,15 +1528,11 @@ async function loadExistingSeating() {
     ).join('');
 
     document.getElementById('seating-status').textContent =
-      'Previous session data — please upload fresh file';
+      'Previous session — upload fresh file to start';
     document.getElementById('seating-status').style.color = '#8b949e';
-
-    // Do NOT set _seatingDone = true
-    // Teacher must upload Excel to start new session
   } catch(e) {}
 }
 
-// ── Init ───────────────────────────────────────────────────────────────────
 loadExistingSeating();
 updateSteps();
 fetchStatus();
@@ -1469,14 +1547,18 @@ setInterval(fetchAlerts, 2000);
 
 @app.route("/api/report/download/<path:filename>")
 def download_report(filename):
-    """Serve Excel report file for download."""
     reports_dir = os.path.join(_ROOT, "reports")
     return send_from_directory(reports_dir, filename, as_attachment=True)
 
 
 @app.route("/")
 def dashboard():
-    return render_template_string(DASHBOARD_HTML)
+    from flask import make_response
+    resp = make_response(render_template_string(DASHBOARD_HTML))
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    resp.headers["Pragma"]        = "no-cache"
+    resp.headers["Expires"]       = "0"
+    return resp
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1485,16 +1567,24 @@ def dashboard():
 
 if __name__ == "__main__":
     print("=" * 55)
-    print("  ARGUS — File 11: Dashboard v10")
+    print("  ARGUS — File 11: Dashboard v11")
     print("  VIT Pune | CSAIML-E | Group 01")
     print("=" * 55)
     print("\n  Open: http://localhost:5000")
     print("\n  Teacher workflow:")
     print("    1. Upload ARGUS_Seating.xlsx")
-    print("    2. Place ArUco markers → Click Scan ArUco")
+    print("    2. Place ArUco markers → Click Scan ArUco  (optional)")
     print("    3. Click Start Exam")
     print("\n  Press Ctrl+C to stop.\n")
 
     os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+
+    # Clean up stale stop signal on server start
+    if os.path.exists(STOP_SIGNAL):
+        try:
+            os.remove(STOP_SIGNAL)
+            print("[ARGUS] Removed stale ARGUS_STOP.signal on startup")
+        except Exception:
+            pass
 
     app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)

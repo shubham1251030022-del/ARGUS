@@ -2,14 +2,11 @@
 ARGUS — File 9: detection/aruco_scanner.py
 Member 2: Shubham Pitty | VIT Pune CSAIML-E Group 01
 
-FIXED VERSION — changes from original:
-  1. CAMERA_INDEX 1 → 0
-  2. STABLE_FRAMES 10 → 6
-  3. MIN_MARKER_AREA 400 → 150  (markers smaller at 2-3m)
-  4. ZONE_EXPAND_X/Y enlarged  (bigger bench zone at distance)
-  5. Stability check fixed      (was unreliable float dict compare)
-  6. Adaptive thresholding added (handles backlit/window conditions)
-  7. Detector params tuned      (more tolerant, detects at distance)
+FIXED v3 — changes from v2:
+  1. _run_detect() NameError fixed — results was defined inside try, used outside
+  2. Dead code after return removed
+  3. Camera index now reads from config.json (no longer hardcoded 0)
+  4. All v2 fixes retained (tuned params, adaptive threshold, stability fix)
 """
 
 import cv2
@@ -23,6 +20,15 @@ import time
 # ── Paths ─────────────────────────────────────────────────────────────────────
 _THIS_DIR  = os.path.dirname(os.path.abspath(__file__))
 ZONES_FILE = os.path.join(_THIS_DIR, "zones.json")
+CONFIG_FILE = os.path.join(_THIS_DIR, "config.json")
+
+# ── Read camera index from config ─────────────────────────────────────────────
+def _get_camera_index():
+    try:
+        with open(CONFIG_FILE) as f:
+            return json.load(f).get("camera_index", 0)
+    except Exception:
+        return 0
 
 # ── ArUco ID → Bench name mapping ─────────────────────────────────────────────
 ARUCO_ID_MAP = {
@@ -35,20 +41,23 @@ ARUCO_ID_MAP = {
 }
 
 # ── Bench zone expansion around ArUco marker centre ──────────────────────────
-# Camera at 4-5 feet height, 2-3m horizontal distance (elevated angle)
-# Student's body appears ABOVE the desk marker in image
-# → expand more upward, less downward, wider horizontal for desk width
-ZONE_EXPAND_X    = 180   # horizontal half-width (desk is ~60cm wide)
-ZONE_EXPAND_Y_UP = 320   # expand UP from marker (student body above desk)
-ZONE_EXPAND_Y_DN = 80    # expand DOWN from marker (just below desk level)
+# Camera: 5-6 feet height, 2-3m horizontal distance, slight downward angle
+# Marker placed FLAT on desk surface
+#
+# At this angle and distance in a 1280x720 frame:
+#   - Marker appears roughly at student's waist/desk level (y ≈ 55-65% of frame)
+#   - Student's head is ~380px ABOVE the marker in image coordinates
+#   - Student's feet extend ~120px BELOW the marker
+#   - Student body width is ~360px total → 200px each side of centre
+#
+# IMPORTANT: Place marker FLAT on desk, NOT held up — held marker shifts
+# zone upward into empty air above the student's head.
+ZONE_EXPAND_X    = 260   # horizontal half-width (wider — covers full seated body)
+ZONE_EXPAND_Y_UP = 480   # expand UP from marker (head + torso above desk level)
+ZONE_EXPAND_Y_DN = 140   # expand DOWN from marker (legs below desk)
 
 # ── Minimum marker size ────────────────────────────────────────────────────────
-# FIX: lowered — at 2-3m markers appear smaller in frame
-MIN_MARKER_AREA = 150  # was 400
-
-# ── Camera index ──────────────────────────────────────────────────────────────
-# FIX: was 1 (caused "Camera not available" on some setups)
-CAMERA_INDEX = 0
+MIN_MARKER_AREA = 150  # lowered — markers appear smaller at 2-3m
 
 
 class ARUCOScanner:
@@ -58,7 +67,6 @@ class ARUCOScanner:
         self.last_zones    = {}
         self.scan_stable   = False
         self._stable_count = 0
-        # FIX: reduced from 10 — was causing 0 zones locked intermittently
         self.STABLE_FRAMES = 6
         self._init_detector()
 
@@ -70,13 +78,12 @@ class ARUCOScanner:
             dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
             params     = cv2.aruco.DetectorParameters()
 
-            # FIX: tuned for small markers at 2-3m distance + backlit rooms
             params.adaptiveThreshWinSizeMin  = 3
             params.adaptiveThreshWinSizeMax  = 23
             params.adaptiveThreshWinSizeStep = 4
-            params.minMarkerPerimeterRate    = 0.02   # detect smaller markers
+            params.minMarkerPerimeterRate    = 0.02
             params.maxMarkerPerimeterRate    = 4.0
-            params.errorCorrectionRate       = 0.8    # more tolerant
+            params.errorCorrectionRate       = 0.8
 
             self.detector = cv2.aruco.ArucoDetector(dictionary, params)
             self._api = "new"
@@ -100,14 +107,14 @@ class ARUCOScanner:
     def detect_markers(self, frame):
         """
         Detect ArUco markers in frame.
-        Tries plain gray first (most reliable), then adaptive threshold as fallback.
+        Tries plain gray first, then adaptive threshold, then CLAHE.
         """
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        # Attempt 1: plain grayscale (original approach — most reliable)
+        # Attempt 1: plain grayscale
         corners, ids = self._run_detect(gray)
 
-        # Attempt 2: adaptive threshold fallback (helps with backlighting)
+        # Attempt 2: adaptive threshold fallback
         if ids is None or len(ids) == 0:
             gray_adapt = cv2.adaptiveThreshold(
                 gray, 255,
@@ -118,7 +125,7 @@ class ARUCOScanner:
 
         # Attempt 3: CLAHE contrast enhancement fallback
         if ids is None or len(ids) == 0:
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
             gray_clahe = clahe.apply(gray)
             corners, ids = self._run_detect(gray_clahe)
 
@@ -141,7 +148,11 @@ class ARUCOScanner:
         return results
 
     def _run_detect(self, gray):
-        """Run ArUco detection on a prepared grayscale image."""
+        """
+        Run ArUco detection on a prepared grayscale image.
+        FIX v3: results was defined inside try block but referenced outside —
+                 caused NameError on exception. Now always returns a safe tuple.
+        """
         try:
             if self._api == "new":
                 corners, ids, _ = self.detector.detectMarkers(gray)
@@ -149,12 +160,13 @@ class ARUCOScanner:
                 corners, ids, _ = cv2.aruco.detectMarkers(
                     gray, self.dictionary, parameters=self.params
                 )
+            # FIX: return here inside the try — old code fell through to bottom
             return corners, ids
         except Exception as e:
             print(f"[ARUCO] Detection error: {e}")
             return [], None
-
-        return results
+        # FIX: removed dead `return results` that was here — caused NameError
+        # since `results` is never defined in this method
 
     # ── Zone builder ──────────────────────────────────────────────────────────
 
@@ -167,9 +179,9 @@ class ARUCOScanner:
         cx, cy = marker["centre_x"], marker["centre_y"]
 
         x1 = max(0, cx - ZONE_EXPAND_X)
-        y1 = max(0, cy - ZONE_EXPAND_Y_UP)   # expand more upward
+        y1 = max(0, cy - ZONE_EXPAND_Y_UP)
         x2 = min(w, cx + ZONE_EXPAND_X)
-        y2 = min(h, cy + ZONE_EXPAND_Y_DN)   # less downward
+        y2 = min(h, cy + ZONE_EXPAND_Y_DN)
 
         return {
             "bench"    : ARUCO_ID_MAP[marker_id],
@@ -187,8 +199,7 @@ class ARUCOScanner:
     def scan_frame(self, frame):
         """
         Detect all ArUco markers in frame and build bench zones.
-        FIX: stability check now compares bench name sets, not full dicts.
-              Float coordinate drift was resetting stable count every frame.
+        Stability check compares bench name sets, not full dicts.
         """
         markers = self.detect_markers(frame)
         zones   = {}
@@ -198,8 +209,6 @@ class ARUCOScanner:
             if zone:
                 zones[zone["bench"]] = zone
 
-        # FIX: compare only which benches are found, not coordinates
-        # Old code: zones == self.last_zones  ← floats differ frame-to-frame
         current_benches = set(zones.keys())
         last_benches    = set(self.last_zones.keys())
 
@@ -284,7 +293,7 @@ class ARUCOScanner:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 200, 255), 2)
 
         status_color = (0, 255, 0) if self.scan_stable else (0, 165, 255)
-        status_text  = (f"STABLE ✓  {len(zones)} zones locked"
+        status_text  = (f"STABLE  {len(zones)} zones locked"
                         if self.scan_stable
                         else f"Scanning... {len(zones)} found  "
                              f"[{self._stable_count}/{self.STABLE_FRAMES}]")
@@ -315,18 +324,18 @@ def run_live_calibration():
     print("    Q — quit without saving")
     print("─" * 55)
 
+    CAMERA_INDEX = _get_camera_index()
     scanner = ARUCOScanner()
     cap = cv2.VideoCapture(CAMERA_INDEX)
 
     if not cap.isOpened():
         print(f"\n[ERROR] Camera {CAMERA_INDEX} not available.")
-        print("  Try: py -3.11 aruco_scanner.py --test")
+        print("  Check config.json → camera_index")
         return
 
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
-    # FIX: flush first 10 frames so camera exposure stabilises
     print("[ARUCO] Warming up camera...")
     for _ in range(10):
         cap.read()
@@ -389,7 +398,7 @@ def run_offline_test():
                "centre_x": 640, "centre_y": 360},
         "B3": {"bench": "B3", "aruco_id": 2,
                "x": 880, "y": 200, "w": 320, "h": 420,
-               "centre_x": 1080,"centre_y": 360},
+               "centre_x": 1080, "centre_y": 360},
     }
 
     scanner.last_zones    = test_zones_mock

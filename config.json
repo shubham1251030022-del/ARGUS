@@ -7,7 +7,7 @@
     "shoulder_slight": 91,
     "shoulder_clear": 92,
     "shoulder_sustained": 93,
-    "camera_index": 0,
+    "camera_index": 1,
     "head_offset_threshold": 0.38,
     "wrist_dist_threshold": 1.8,
     "wrist_velocity_threshold": 4.0,

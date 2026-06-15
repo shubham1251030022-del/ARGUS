@@ -1,12 +1,32 @@
 {
     "B1": {
-        "x": 522,
-        "y": 13,
-        "w": 360,
-        "h": 400,
+        "x": 469,
+        "y": 0,
+        "w": 520,
+        "h": 385,
         "aruco_id": 0,
         "student_name": "Arya",
-        "status": "ACTIVE",
-        "roll_number": "1251030275"
+        "roll_number": "1251030275",
+        "status": "ACTIVE"
+    },
+    "B2": {
+        "x": 440,
+        "y": 80,
+        "w": 400,
+        "h": 580,
+        "aruco_id": 1,
+        "student_name": "Shatakshi",
+        "roll_number": "1251030199",
+        "status": "ACTIVE"
+    },
+    "B3": {
+        "x": 860,
+        "y": 80,
+        "w": 400,
+        "h": 580,
+        "aruco_id": 2,
+        "student_name": "Swayam",
+        "roll_number": "1251030068",
+        "status": "ACTIVE"
     }
 }
